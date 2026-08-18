@@ -76,14 +76,14 @@ python -m karospace_export.app
 
 ## GUI Workflow
 
-1. Set input `.h5ad` and output directory.
+1. Set input `.h5ad` and output directory. SpatialData `.zarr` paths can be typed manually.
 2. Click **Inspect H5AD** to populate searchable dropdowns from `adata.obs` and `adata.var_names`.
 3. Pick:
-   - Section groupby
-   - Initial color
-   - Additional colors
-   - Genes mode (`hvgs`, `top_mean`, `list_file`, `manual_list`)
-4. (Optional) use the `Default` profile.
+   - Section key
+   - Main cell annotation
+   - Cell annotations
+   - Feature list from inspected `var_names`
+4. Configure optional feature storage, section metadata, pseudobulk, pathway, neighbor, interaction, and overlay settings.
 5. Click **Export**.
 
 Result: `KaroSpace_YYYYMMDD_HHMMSS.html` in the selected output directory.
@@ -91,12 +91,16 @@ Result: `KaroSpace_YYYYMMDD_HHMMSS.html` in the selected output directory.
 ## What The Builder Maps To
 
 The GUI fields map directly to KaroSpace export arguments, including:
-- `color`, `title`, `theme`, `outline_by`
+- `main_cell_annotation`, `title`, `outline_by`
 - `min_panel_size`, `spot_size`, `downsample`
-- `additional_colors`, `genes`, `use_hvgs`, `hvg_limit`
-- `marker_genes_groupby`, `marker_genes_top_n`
-- `neighbor_stats_groupby`, `neighbor_stats_permutations`, `neighbor_stats_seed`
-- `interaction_markers_groupby` and interaction marker limits
+- `cell_annotations`, `features`, `feature_encoding`, `feature_storage`
+- `feature_value_encoding`, `feature_manifest_path`, `feature_sidecar_shard_size`
+- `section_metadata`, `section_metadata_extra`, `metadata_value_order`, `metadata_labels`
+- `pseudobulk`, `pseudobulk_additional_annotations`, pseudobulk thresholds, and pathway settings
+- `neighbor_stats_annotations`, `neighbor_stats_permutations`, `neighbor_stats_seed`
+- `interaction_markers`, interaction marker limits, `section_rotations`, `deconvolutions`, `section_images`
+
+The builder exports only explicitly selected features.
 
 Coordinates modes:
 - `auto`

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
 from pathlib import Path
+import colorsys
 import http.server
+import json
 import os
 import queue
 import socketserver
@@ -15,8 +18,6 @@ import threading
 import time
 import traceback
 import webbrowser
-
-from .utils import parse_genes_mode, resolve_gene_names
 
 try:
     import tkinter as tk
@@ -47,7 +48,7 @@ _KAROSPACE_LIGHT_PALETTE = {
     "light_orange": _KI_COLORS["light_orange"],
     "light_blue": _KI_COLORS["light_blue"],
     "plum": _KI_COLORS["plum"],
-    "background": "#f0f1f4",
+    "background": "#ffffff",
     "text": "#1a1d23",
     "panel_bg": "#ffffff",
     "border": "#d8dbe1",
@@ -56,8 +57,14 @@ _KAROSPACE_LIGHT_PALETTE = {
     "hover_bg": "#e6e8ed",
     "accent": _KI_COLORS["plum"],
     "accent_strong": _KI_COLORS["plum_dark"],
+    "secondary": _KI_COLORS["plum"],
+    "on_secondary": "#ffffff",
+    "on_secondary_idle": _KI_COLORS["plum"],
+    "danger": "#c9252d",
+    "danger_hover": "#a51f25",
+    "on_danger": "#ffffff",
     "on_accent": "#ffffff",
-    "hero_bg": "#faf7f9",
+    "hero_bg": "#ffffff",
 }
 
 _KAROSPACE_DARK_PALETTE = {
@@ -66,7 +73,7 @@ _KAROSPACE_DARK_PALETTE = {
     "light_orange": _KI_COLORS["light_orange"],
     "light_blue": _KI_COLORS["light_blue"],
     "plum": _KI_COLORS["plum"],
-    "background": "#121316",
+    "background": "#000000",
     "text": "#e8eaef",
     "panel_bg": "#1c1d22",
     "border": "#2e3038",
@@ -75,8 +82,14 @@ _KAROSPACE_DARK_PALETTE = {
     "hover_bg": "#282a31",
     "accent": _KI_COLORS["orange"],
     "accent_strong": _KI_COLORS["plum"],
+    "secondary": _KI_COLORS["orange"],
+    "on_secondary": "#1a1d23",
+    "on_secondary_idle": "#ffffff",
+    "danger": "#e04b53",
+    "danger_hover": "#b9333a",
+    "on_danger": "#ffffff",
     "on_accent": "#1a1a1a",
-    "hero_bg": "#1e1a1c",
+    "hero_bg": "#000000",
 }
 
 
@@ -86,6 +99,48 @@ def _palette_for_mode(mode: str) -> dict[str, str]:
         if str(mode).strip().lower() == "dark"
         else dict(_KAROSPACE_LIGHT_PALETTE)
     )
+
+
+def _shift_hex_luminance(hex_color: str, points: float) -> str:
+    return _transform_hex_luminance(hex_color, points=points)
+
+
+def _set_hex_luminance(hex_color: str, luminance_percent: float) -> str:
+    return _transform_hex_luminance(hex_color, absolute=luminance_percent)
+
+
+def _is_dark_palette(palette: dict[str, str]) -> bool:
+    return str(palette.get("background", "")).strip().lower() == "#000000"
+
+
+def _secondary_idle_color(palette: dict[str, str]) -> str:
+    return _set_hex_luminance(palette["secondary"], 5 if _is_dark_palette(palette) else 99)
+
+
+def _transform_hex_luminance(
+    hex_color: str,
+    *,
+    points: float | None = None,
+    absolute: float | None = None,
+) -> str:
+    cleaned = hex_color.strip().lstrip("#")
+    if len(cleaned) != 6:
+        return hex_color
+    try:
+        red = int(cleaned[0:2], 16) / 255
+        green = int(cleaned[2:4], 16) / 255
+        blue = int(cleaned[4:6], 16) / 255
+    except ValueError:
+        return hex_color
+
+    hue, luminance, saturation = colorsys.rgb_to_hls(red, green, blue)
+    if absolute is not None:
+        luminance = absolute / 100.0
+    elif points is not None:
+        luminance = luminance + (points / 100.0)
+    luminance = max(0.0, min(1.0, luminance))
+    red, green, blue = colorsys.hls_to_rgb(hue, luminance, saturation)
+    return f"#{round(red * 255):02x}{round(green * 255):02x}{round(blue * 255):02x}"
 
 
 def _ui_font() -> str:
@@ -118,18 +173,18 @@ def _ctk_theme_config(palette: dict[str, str]) -> dict[str, dict[str, object]]:
             "fg_color": palette.get("hero_bg", palette["panel_bg"]),
             "corner_radius": 20,
             "border_width": 2,
-            "border_color": palette["accent"],
+            "border_color": palette["secondary"],
         },
         "highlight_card": {
             "fg_color": palette["panel_bg"],
             "corner_radius": 14,
             "border_width": 1,
-            "border_color": palette["accent_strong"],
+            "border_color": palette["secondary"],
         },
         "sub_frame": {"fg_color": "transparent", "corner_radius": 0},
         "section_label": {
-            "font": (ui, 10, "bold"),
-            "text_color": palette["accent"],
+            "font": (ui, 11, "bold"),
+            "text_color": palette["secondary"],
             "fg_color": "transparent",
             "anchor": "w",
         },
@@ -146,19 +201,19 @@ def _ctk_theme_config(palette: dict[str, str]) -> dict[str, dict[str, object]]:
             "anchor": "w",
         },
         "subheader_label": {
-            "font": (ui, 11),
+            "font": (ui, 12),
             "text_color": palette["muted"],
             "fg_color": "transparent",
             "anchor": "w",
         },
         "field_label": {
-            "font": (ui, 11, "bold"),
+            "font": (ui, 12, "bold"),
             "text_color": palette["text"],
             "fg_color": "transparent",
             "anchor": "w",
         },
         "body_label": {
-            "font": (ui, 10),
+            "font": (ui, 11),
             "text_color": palette["text"],
             "fg_color": "transparent",
             "anchor": "w",
@@ -173,30 +228,30 @@ def _ctk_theme_config(palette: dict[str, str]) -> dict[str, dict[str, object]]:
             "border_width": 0,
         },
         "secondary_button": {
-            "fg_color": palette["input_bg"],
-            "hover_color": palette["hover_bg"],
-            "text_color": palette["text"],
+            "fg_color": _secondary_idle_color(palette),
+            "hover_color": palette["secondary"],
+            "text_color": palette.get("on_secondary_idle", palette["on_secondary"]),
             "corner_radius": 10,
-            "font": (ui, 10),
-            "height": 36,
+            "font": (ui, 11),
+            "height": 40,
             "border_width": 1,
-            "border_color": palette["border"],
+            "border_color": palette["secondary"],
         },
         "pill_label": {
-            "font": (ui, 9, "bold"),
+            "font": (ui, 10, "bold"),
             "text_color": palette.get("on_accent", "#ffffff"),
             "fg_color": palette["accent"],
             "corner_radius": 999,
             "padx": 12,
-            "pady": 4,
+            "pady": 6,
         },
         "muted_pill_label": {
-            "font": (ui, 9, "bold"),
+            "font": (ui, 10, "bold"),
             "text_color": palette["text"],
             "fg_color": palette["hover_bg"],
             "corner_radius": 999,
             "padx": 12,
-            "pady": 4,
+            "pady": 6,
         },
         "entry": {
             "fg_color": palette["input_bg"],
@@ -205,8 +260,8 @@ def _ctk_theme_config(palette: dict[str, str]) -> dict[str, dict[str, object]]:
             "border_color": palette["border"],
             "border_width": 1,
             "corner_radius": 10,
-            "height": 36,
-            "font": (ui, 11),
+            "height": 40,
+            "font": (ui, 12),
         },
         "combo": {
             "fg_color": palette["input_bg"],
@@ -217,7 +272,7 @@ def _ctk_theme_config(palette: dict[str, str]) -> dict[str, dict[str, object]]:
             "dropdown_text_color": palette["text"],
             "dropdown_hover_color": palette["hover_bg"],
             "corner_radius": 10,
-            "font": (ui, 11),
+            "font": (ui, 12),
         },
         "checkbox": {
             "fg_color": palette["accent"],
@@ -225,18 +280,18 @@ def _ctk_theme_config(palette: dict[str, str]) -> dict[str, dict[str, object]]:
             "checkmark_color": palette.get("on_accent", "#ffffff"),
             "text_color": palette["text"],
             "border_color": palette["border"],
-            "font": (ui, 10),
+            "font": (ui, 11),
             "corner_radius": 6,
         },
         "tabview": {
             "fg_color": palette["panel_bg"],
             "segmented_button_fg_color": palette["hover_bg"],
             "segmented_button_selected_color": palette["accent"],
-            "segmented_button_selected_hover_color": palette["accent_strong"],
+            "segmented_button_selected_hover_color": palette["accent"],
             "segmented_button_unselected_color": palette["hover_bg"],
-            "segmented_button_unselected_hover_color": palette["border"],
+            "segmented_button_unselected_hover_color": _set_hex_luminance(palette["secondary"], 98),
             "text_color": palette["text"],
-            "corner_radius": 14,
+            "corner_radius": 0,
             "border_width": 0,
             "border_color": palette["border"],
         },
@@ -247,7 +302,7 @@ def _ctk_theme_config(palette: dict[str, str]) -> dict[str, dict[str, object]]:
         "textbox": {
             "fg_color": palette["input_bg"],
             "text_color": palette["text"],
-            "border_color": palette["border"],
+            "border_color": palette["secondary"],
             "corner_radius": 10,
             "border_width": 1,
             "font": (mono, 10),
@@ -256,7 +311,7 @@ def _ctk_theme_config(palette: dict[str, str]) -> dict[str, dict[str, object]]:
         },
         "progress": {
             "fg_color": palette["hover_bg"],
-            "progress_color": palette["accent"],
+            "progress_color": palette["secondary"],
             "border_color": palette["border"],
             "corner_radius": 10,
             "height": 18,
@@ -276,6 +331,82 @@ def _get_numpy():
     return np
 
 
+def _style_secondary_button_for_palette(button: tk.Widget, palette: dict[str, str], *, borderless: bool = False) -> None:
+    try:
+        button.configure(
+            fg_color=_secondary_idle_color(palette),
+            hover_color=palette["secondary"],
+            text_color=palette.get("on_secondary_idle", palette["on_secondary"]),
+            border_width=0 if borderless else 1,
+            border_color=palette["secondary"],
+        )
+    except Exception:
+        pass
+
+
+def _bind_secondary_button_feedback(button: tk.Widget, palette_getter, *, reset_callback=None) -> None:
+    def pointer_inside() -> bool:
+        try:
+            pointer_x, pointer_y = button.winfo_pointerxy()
+            root_x = button.winfo_rootx()
+            root_y = button.winfo_rooty()
+            return root_x <= pointer_x <= root_x + button.winfo_width() and root_y <= pointer_y <= root_y + button.winfo_height()
+        except Exception:
+            return False
+
+    def reset() -> None:
+        if reset_callback is not None:
+            reset_callback()
+        else:
+            _style_secondary_button_for_palette(button, palette_getter())
+
+    def on_enter(_event: object) -> None:
+        try:
+            if button.cget("state") == "disabled":
+                return
+            palette = palette_getter()
+            button.configure(fg_color=palette["secondary"], text_color=palette["on_secondary"])
+        except Exception:
+            pass
+
+    def on_press(_event: object) -> None:
+        try:
+            if button.cget("state") == "disabled":
+                return
+            palette = palette_getter()
+            button.configure(
+                fg_color=_shift_hex_luminance(palette["secondary"], -10),
+                text_color=palette["on_secondary"],
+            )
+        except Exception:
+            pass
+
+    def on_release(_event: object) -> None:
+        try:
+            if button.cget("state") == "disabled":
+                return
+            if pointer_inside():
+                palette = palette_getter()
+                button.configure(fg_color=palette["secondary"], text_color=palette["on_secondary"])
+            else:
+                reset()
+        except Exception:
+            pass
+
+    def on_leave(_event: object) -> None:
+        try:
+            if button.cget("state") == "disabled":
+                return
+            reset()
+        except Exception:
+            pass
+
+    button.bind("<Enter>", on_enter, add="+")
+    button.bind("<ButtonPress-1>", on_press, add="+")
+    button.bind("<ButtonRelease-1>", on_release, add="+")
+    button.bind("<Leave>", on_leave, add="+")
+
+
 class SearchableListEditor(_CTK_FRAME_BASE):
     def __init__(
         self,
@@ -285,9 +416,12 @@ class SearchableListEditor(_CTK_FRAME_BASE):
         height: int = 8,
         help_text: str | None = None,
         palette: dict[str, str] | None = None,
+        on_change=None,
     ) -> None:
         self._palette = dict(palette or _palette_for_mode("dark"))
         self._theme = _ctk_theme_config(self._palette)
+        self._on_change = on_change
+        self._suspend_change_notification = False
         super().__init__(parent, **self._theme["sub_frame"])
         self._choices: list[str] = []
         self._input_var = tk.StringVar(value="")
@@ -312,6 +446,7 @@ class SearchableListEditor(_CTK_FRAME_BASE):
         self.entry.bind("<Return>", lambda _event: self.add_current())
 
         self.add_btn = ctk.CTkButton(controls, text="+ Add", command=self.add_current, width=88, **self._theme["secondary_button"])
+        _bind_secondary_button_feedback(self.add_btn, lambda: self._palette)
         self.add_btn.grid(row=0, column=1, padx=(0, 6))
         self.remove_btn = ctk.CTkButton(
             controls,
@@ -320,8 +455,10 @@ class SearchableListEditor(_CTK_FRAME_BASE):
             width=88,
             **self._theme["secondary_button"],
         )
+        _bind_secondary_button_feedback(self.remove_btn, lambda: self._palette)
         self.remove_btn.grid(row=0, column=2, padx=(0, 6))
         self.clear_btn = ctk.CTkButton(controls, text="Clear", command=self.clear, width=88, **self._theme["secondary_button"])
+        _bind_secondary_button_feedback(self.clear_btn, lambda: self._palette)
         self.clear_btn.grid(row=0, column=3)
 
         list_wrap = ctk.CTkFrame(self, **self._theme["sub_frame"])
@@ -390,15 +527,19 @@ class SearchableListEditor(_CTK_FRAME_BASE):
         self._input_var.set("")
         self.entry.set("")
         self._update_choices("")
+        self._notify_change()
 
     def remove_selected(self) -> None:
         for idx in reversed(self.listbox.curselection()):
             self.listbox.delete(idx)
+        self._notify_change()
 
     def clear(self) -> None:
         self.listbox.delete(0, "end")
+        self._notify_change()
 
     def set_items(self, values: list[str] | tuple[str, ...]) -> None:
+        self._suspend_change_notification = True
         self.clear()
         seen: set[str] = set()
         for raw in values:
@@ -407,9 +548,21 @@ class SearchableListEditor(_CTK_FRAME_BASE):
                 continue
             seen.add(value)
             self.listbox.insert("end", value)
+        self._suspend_change_notification = False
+        self._notify_change()
 
     def get_items(self) -> list[str]:
         return [str(v) for v in self.listbox.get(0, "end")]
+
+    def _notify_change(self) -> None:
+        if self._suspend_change_notification:
+            return
+        if self._on_change is None:
+            return
+        try:
+            self._on_change()
+        except Exception:
+            pass
 
     def set_enabled(self, enabled: bool) -> None:
         state = "normal" if enabled else "disabled"
@@ -491,6 +644,7 @@ class SearchableMultiSelectEditor(_CTK_FRAME_BASE):
             width=100,
             **self._theme["secondary_button"],
         )
+        _bind_secondary_button_feedback(self.select_all_btn, lambda: self._palette)
         self.select_all_btn.grid(row=0, column=1, padx=(0, 6))
         self.clear_btn = ctk.CTkButton(
             controls,
@@ -499,6 +653,7 @@ class SearchableMultiSelectEditor(_CTK_FRAME_BASE):
             width=90,
             **self._theme["secondary_button"],
         )
+        _bind_secondary_button_feedback(self.clear_btn, lambda: self._palette)
         self.clear_btn.grid(row=0, column=2)
 
         list_wrap = ctk.CTkFrame(self, **self._theme["sub_frame"])
@@ -658,35 +813,125 @@ class BuilderConfig:
     h5ad_path: Path
     outdir: Path
     coords_mode: str | None
+    spatialdata_table: str | None
     section_groupby: str
+    section_order: list[str] | None
+    section_metadata: list[str] | None
+    section_metadata_extra: list[str] | None
+    metadata_value_order: dict[str, list[str]] | None
+    metadata_max_columns: int | None
     initial_color: str
     title: str
-    theme: str
     enable_numba_jit: bool
     outline_by: str | None
+    metadata_labels: dict[str, str] | None
+    viewer_info_html: str | None
+    tutorial: bool
     min_panel_size: int
     spot_size: float | str | None
     downsample: int | None
     additional_colors: list[str] | None
     genes: list[str] | None
-    use_hvgs: bool
-    hvg_limit: int
-    marker_genes_groupby: list[str] | None
-    genes_mode: str
-    marker_genes_top_n: int
+    feature_encoding: str
+    feature_value_encoding: str
+    feature_storage: str
+    feature_manifest_path: str | None
+    feature_sidecar_shard_size: int
+    feature_sparse_zero_threshold: float
+    modalities: list[str] | None
     neighbor_stats_groupby: list[str] | None
     neighbor_stats_permutations: int | None
     neighbor_stats_seed: int
-    interaction_markers_enabled: bool
-    interaction_markers_groupby: list[str] | None
+    pseudobulk: str | None
+    pseudobulk_additional_annotations: list[str] | None
+    pseudobulk_replicate_annotation: str | None
+    pseudobulk_simple_constrast_categories: dict[str, list[str] | None] | list[str] | None
+    pseudobulk_counts_layer: str | None
+    pseudobulk_min_cell_counts: int
+    pseudobulk_min_gene_counts: int
+    pseudobulk_min_cells_per_pseudobulk: int
+    pseudobulk_min_replicates: int
+    pseudobulk_min_pct_expressed: float
+    pseudobulk_p_adjust_method: str
+    pseudobulk_padj_cutoff: float
+    pseudobulk_log2fc_cutoff: float
+    pseudobulk_deseq2_fit_type: str
+    pseudobulk_n_cpus: int
+    pseudobulk_embed_top_n_per_comparison: int
+    pathway_gmt: list[str] | None
+    pathway_organism: str
+    pathway_top_n: int
+    pathway_min_overlap: int
+    pathway_gsea_permutations: int
+    interaction_markers: str | None
     interaction_markers_top_targets: int
     interaction_markers_top_genes: int
     interaction_markers_min_cells: int
     interaction_markers_min_neighbors: int
+    section_rotations: dict[str, float] | None
+    deconvolutions: dict[str, str] | None
+    gene_correlation_top_n: int
+    category_means_n_genes: int
+    spatial_variable_genes_n: int
+    scalebar_unit: str
+    section_images: dict[str, object] | None
+    section_images_max_px: int
 
 
 class _ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
+
+
+class _ExportCancelled(Exception):
+    pass
+
+
+class _EventLogTee:
+    def __init__(self, stream, event_queue: queue.Queue[tuple[str, object]], *, prefix: str = "") -> None:
+        self._stream = stream
+        self._queue = event_queue
+        self._prefix = prefix
+        self._buffer = ""
+
+    @property
+    def encoding(self):
+        return getattr(self._stream, "encoding", None)
+
+    def isatty(self) -> bool:
+        try:
+            return bool(self._stream.isatty())
+        except Exception:
+            return False
+
+    def write(self, text) -> int:
+        if text is None:
+            return 0
+        value = str(text)
+        try:
+            self._stream.write(value)
+        except Exception:
+            pass
+
+        self._buffer += value.replace("\r", "\n")
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            self._emit(line)
+        return len(value)
+
+    def flush(self) -> None:
+        try:
+            self._stream.flush()
+        except Exception:
+            pass
+        if self._buffer.strip():
+            self._emit(self._buffer)
+        self._buffer = ""
+
+    def _emit(self, line: str) -> None:
+        message = line.strip()
+        if not message:
+            return
+        self._queue.put(("log", f"{self._prefix}{message}"))
 
 
 class ExportApp(ctk.CTk if ctk is not None else object):
@@ -694,6 +939,8 @@ class ExportApp(ctk.CTk if ctk is not None else object):
     _NEIGHBOR_MATRIX_BUDGET_BYTES = 512 * 1024 * 1024
     _MARKER_GROUPBY_MAX_UNIQUE = 2048
     _INTERACTION_GROUPBY_MAX_UNIQUE = 512
+    _HTML_SIZE_MB_PER_ELEMENT = 2.313e-6
+    _HTML_SIZE_WARNING_ELEMENTS = 150_000_000
 
     def __init__(self) -> None:
         super().__init__()
@@ -703,14 +950,28 @@ class ExportApp(ctk.CTk if ctk is not None else object):
 
         self._queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self._export_thread: threading.Thread | None = None
+        self._cancel_requested = threading.Event()
         self._server: _ThreadingHTTPServer | None = None
         self._server_thread: threading.Thread | None = None
         self._last_outdir: Path | None = None
         self._last_output_html: Path | None = None
+        self._has_valid_input_file = False
+        self._has_inspected_input_file = False
+        self._inspect_locked_after_press = False
         self._inspected_h5ad_path: Path | None = None
         self._inspected_var_name_set: set[str] | None = None
         self._inspected_coords_mode: str | None = None
+        self._inspected_n_cells: int | None = None
+        self._inspected_n_genes: int | None = None
+        self._inspected_obs_cols: set[str] = set()
+        self._inspected_section_counts_by_column: dict[str, list[int]] = {}
         self._themed_widgets: dict[str, list[tk.Widget]] = {}
+        self._inspection_gated_widgets: list[tk.Widget] = []
+        self._right_panel_widgets: list[tk.Widget] = []
+        self._secondary_action_buttons: list[tk.Widget] = []
+        self._tab_hover_bound: set[str] = set()
+        self._placeholder_refreshers: list[object] = []
+        self._hidden_widget_layouts: dict[tk.Widget, tuple[str, dict[str, object]]] = {}
 
         self._build_style()
         self._build_variables()
@@ -750,16 +1011,20 @@ class ExportApp(ctk.CTk if ctk is not None else object):
             self.log_text.configure(**self._theme["textbox"])
         if hasattr(self, "progress"):
             self.progress.configure(**self._theme["progress"])
+        if hasattr(self, "theme_toggle_btn"):
+            self.theme_toggle_btn.configure(**self._theme["secondary_button"])
+            self._sync_theme_toggle()
         if hasattr(self, "main_scroll_frame"):
             self.main_scroll_frame.configure(
                 scrollbar_button_color=palette["hover_bg"],
                 scrollbar_button_hover_color=palette["accent"],
             )
         self._sync_runtime_chip()
-
         for attr in (
             "additional_colors_editor",
             "groupby_editor",
+            "section_metadata_editor",
+            "section_metadata_extra_editor",
             "manual_genes_editor",
             "selection_additional_picker",
             "selection_groupby_picker",
@@ -768,6 +1033,18 @@ class ExportApp(ctk.CTk if ctk is not None else object):
             widget = getattr(self, attr, None)
             if widget is not None and hasattr(widget, "apply_palette"):
                 widget.apply_palette(palette)
+        for button in self._secondary_action_buttons:
+            self._style_secondary_action_button(button)
+        for refresh_placeholder in self._placeholder_refreshers:
+            try:
+                refresh_placeholder()
+            except Exception:
+                pass
+        self._sync_tab_button_styles()
+        if hasattr(self, "inspect_btn"):
+            self._refresh_input_gate()
+        if hasattr(self, "export_estimate_summary_label"):
+            self._update_export_estimate()
 
     def _register_theme_widget(self, role: str, widget: tk.Widget) -> tk.Widget:
         self._themed_widgets.setdefault(role, []).append(widget)
@@ -814,6 +1091,7 @@ class ExportApp(ctk.CTk if ctk is not None else object):
             kwargs["width"] = width
         button = ctk.CTkButton(parent, **kwargs)
         self._register_theme_widget("secondary_button", button)
+        self._bind_secondary_press_feedback(button)
         return button
 
     def _primary_button(self, parent: tk.Widget, text: str, command, width: int | None = None) -> ctk.CTkButton:
@@ -874,13 +1152,577 @@ class ExportApp(ctk.CTk if ctk is not None else object):
     def _sync_app_theme_to_viewer_setting(self) -> None:
         self._apply_app_theme(self.theme_var.get())
 
-    def _on_theme_selected(self, selected_mode: str) -> None:
-        mode = str(selected_mode).strip().lower()
-        if mode not in {"light", "dark"}:
-            mode = "dark"
-        if self.theme_var.get().strip().lower() != mode:
-            self.theme_var.set(mode)
-        self._apply_app_theme(mode)
+    def _toggle_theme(self) -> None:
+        current = self.theme_var.get().strip().lower()
+        next_mode = "light" if current == "dark" else "dark"
+        self.theme_var.set(next_mode)
+        self._apply_app_theme(next_mode)
+
+    def _sync_theme_toggle(self) -> None:
+        if not hasattr(self, "theme_toggle_btn"):
+            return
+        mode = self.theme_var.get().strip().lower()
+        self.theme_toggle_btn.configure(text="☀" if mode == "dark" else "☾")
+
+    @staticmethod
+    def _guide_text() -> str:
+        return (
+            "Basic tab\n"
+            "- Input file: absolute path to your AnnData .h5ad file, or a SpatialData .zarr path typed manually.\n"
+            "- Output directory: folder where KaroSpace_YYYYMMDD_HHMMSS.html is written.\n"
+            "- Coordinates: auto/obsm/obs-centroid modes are converted to KaroSpace spatial input.\n"
+            "- Section key: section split column used by load_spatial_data(section_key=...).\n"
+            "- Main cell annotation, outline, metadata labels, tutorial, and title map to export_to_html.\n"
+            "- Runtime mode: optional numba JIT performance mode (can be less stable in frozen app).\n"
+            "- Downsample: integer cells per section (blank keeps all).\n\n"
+            "Colors tab\n"
+            "- additional_colors maps to cell_annotations in the new KaroSpace API.\n"
+            "- analysis annotations feed pseudobulk_additional_annotations and optional neighbor stats.\n"
+            "- section_metadata and section_metadata_extra control section filters and stored section metadata.\n\n"
+            "Genes tab\n"
+            "- Tick selection mode: optional inspected multi-select mode. Tick obs/features and export directly without manually adding rows.\n"
+            "- features: build a var_names list manually with the searchable picker or tick selections.\n"
+            "- feature_storage, feature_encoding, sidecar shard size, and modalities map directly to KaroSpace feature options.\n\n"
+            "Cells tab\n"
+            "- Downsample: integer cells per section (blank keeps all).\n\n"
+            "Advanced tab\n"
+            "- Min panel size, spot size, feature/pseudobulk/pathway thresholds.\n"
+            "- Neighbor stats annotations/permutations/seed and interaction marker controls.\n"
+            "- Metadata value order, section rotations, deconvolutions, section images, modalities, and discovery-panel limits.\n"
+            "- Serve after export starts a local preview server for the latest KaroSpace_*.html export.\n\n"
+            "Tip: click Inspect H5AD to load searchable obs dropdown choices and var_names gene pickers."
+        )
+
+    def _show_guide_popup(self) -> None:
+        existing = getattr(self, "_guide_popup", None)
+        if existing is not None and existing.winfo_exists():
+            existing.destroy()
+            return
+
+        popup = ctk.CTkToplevel(self)
+        self._guide_popup = popup
+        popup.overrideredirect(True)
+        popup.geometry("720x620")
+        popup.minsize(560, 440)
+        popup.configure(**self._theme["root"])
+        popup.columnconfigure(0, weight=1)
+        popup.rowconfigure(1, weight=1)
+        popup.bind("<Escape>", lambda _event: popup.destroy())
+
+        self.update_idletasks()
+        x = self.winfo_rootx() + max(24, int((self.winfo_width() - 720) / 2))
+        y = self.winfo_rooty() + 96
+        popup.geometry(f"720x620+{x}+{y}")
+
+        header = ctk.CTkFrame(popup, **self._theme["sub_frame"])
+        header.grid(row=0, column=0, sticky="ew", padx=18, pady=(18, 10))
+        header.columnconfigure(0, weight=1)
+        ctk.CTkLabel(header, text="Guide & Workflow", **self._theme["header_label"]).grid(row=0, column=0, sticky="w")
+        close_btn = ctk.CTkButton(header, text="×", command=popup.destroy, width=42, **self._theme["secondary_button"])
+        close_btn.grid(row=0, column=1, sticky="e")
+
+        text = ctk.CTkTextbox(popup, wrap="word", **self._theme["textbox"])
+        text.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 18))
+        text.insert("1.0", self._guide_text())
+        text.configure(state="disabled")
+        popup.focus()
+
+    def _on_tab_selected(self) -> None:
+        if not hasattr(self, "notebook"):
+            return
+        selected = self.notebook.get()
+        gated_tabs = {"Colors", "Genes", "Cells", "Advanced"}
+        if selected in gated_tabs and not self._has_inspected_input_file:
+            self.notebook.set(self._last_enabled_tab)
+            self._sync_tab_button_styles()
+            return
+        self._last_enabled_tab = selected
+        self._sync_tab_button_styles()
+
+    def _valid_h5ad_path(self) -> Path | None:
+        raw = self.h5ad_var.get().strip()
+        if not raw:
+            return None
+        path = Path(raw).expanduser()
+        try:
+            resolved = path.resolve()
+        except Exception:
+            return None
+        suffix = resolved.suffix.lower()
+        if resolved.exists() and (
+            (resolved.is_file() and suffix == ".h5ad")
+            or (resolved.is_dir() and suffix == ".zarr")
+        ):
+            return resolved
+        return None
+
+    def _configure_widget_state(self, widget: object | None, enabled: bool) -> None:
+        if widget is None:
+            return
+        try:
+            widget.configure(state="normal" if enabled else "disabled")
+        except Exception:
+            pass
+        if enabled:
+            for role, widgets in self._themed_widgets.items():
+                if widget in widgets:
+                    style = self._theme.get(role)
+                    if style:
+                        try:
+                            widget.configure(**style)
+                        except Exception:
+                            pass
+                    break
+            return
+
+        disabled_styles = {
+            "fg_color": self._app_palette["hover_bg"],
+            "text_color": self._app_palette["muted"],
+            "button_color": self._app_palette["hover_bg"],
+            "button_hover_color": self._app_palette["hover_bg"],
+            "hover_color": self._app_palette["hover_bg"],
+            "border_color": self._app_palette["border"],
+        }
+        for key, value in disabled_styles.items():
+            try:
+                widget.configure(**{key: value})
+            except Exception:
+                pass
+
+    def _set_widgets_visible(self, widgets: list[tk.Widget], visible: bool) -> None:
+        for widget in widgets:
+            try:
+                if visible:
+                    saved = self._hidden_widget_layouts.pop(widget, None)
+                    if saved is None:
+                        continue
+                    manager, info = saved
+                    if manager == "grid":
+                        widget.grid(**info)
+                    elif manager == "pack":
+                        widget.pack(**info)
+                    elif manager == "place":
+                        widget.place(**info)
+                else:
+                    if widget in self._hidden_widget_layouts:
+                        continue
+                    manager = widget.winfo_manager()
+                    if manager == "grid":
+                        info = dict(widget.grid_info())
+                        self._hidden_widget_layouts[widget] = (manager, info)
+                        widget.grid_remove()
+                    elif manager == "pack":
+                        info = dict(widget.pack_info())
+                        self._hidden_widget_layouts[widget] = (manager, info)
+                        widget.pack_forget()
+                    elif manager == "place":
+                        info = dict(widget.place_info())
+                        self._hidden_widget_layouts[widget] = (manager, info)
+                        widget.place_forget()
+            except Exception:
+                pass
+
+    def _refresh_tab_gate(self) -> None:
+        if not hasattr(self, "notebook"):
+            return
+        segmented = getattr(self.notebook, "_segmented_button", None)
+        buttons = getattr(segmented, "_buttons_dict", {}) if segmented is not None else {}
+        for tab_name in ("Colors", "Genes", "Cells", "Advanced"):
+            button = buttons.get(tab_name)
+            self._configure_widget_state(button, self._has_inspected_input_file)
+        if not self._has_inspected_input_file and self.notebook.get() in {"Colors", "Genes", "Cells", "Advanced"}:
+            self.notebook.set("Basic")
+            self._last_enabled_tab = "Basic"
+        self._sync_tab_button_styles()
+
+    def _sync_tab_button_styles(self) -> None:
+        if not hasattr(self, "notebook"):
+            return
+        segmented = getattr(self.notebook, "_segmented_button", None)
+        buttons = getattr(segmented, "_buttons_dict", {}) if segmented is not None else {}
+        selected = self.notebook.get()
+        if segmented is not None:
+            try:
+                segmented.grid_configure(sticky="ew", padx=0)
+                for column_index in range(len(buttons)):
+                    segmented.columnconfigure(column_index, weight=1)
+                segmented.configure(
+                    fg_color=self._app_palette["hover_bg"],
+                    unselected_color=self._app_palette["hover_bg"],
+                    unselected_hover_color=_set_hex_luminance(self._app_palette["secondary"], 98),
+                    corner_radius=0,
+                )
+            except Exception:
+                pass
+
+        for tab_name, button in buttons.items():
+            try:
+                disabled = button.cget("state") == "disabled"
+            except Exception:
+                disabled = False
+
+            try:
+                button.configure(
+                    border_width=0,
+                    border_color=self._app_palette["hover_bg"],
+                    corner_radius=10,
+                    text_color=(
+                        self._app_palette["muted"]
+                        if disabled
+                        else self._app_palette.get("on_accent", "#ffffff")
+                        if tab_name == selected
+                        else self._app_palette["text"]
+                    ),
+                )
+            except Exception:
+                pass
+
+            if tab_name in self._tab_hover_bound:
+                continue
+
+            def on_enter(_event: object, name: str = tab_name, tab_button: tk.Widget = button) -> None:
+                try:
+                    if tab_button.cget("state") == "disabled":
+                        return
+                    if self.notebook.get() == name:
+                        tab_button.configure(text_color=self._app_palette.get("on_accent", "#ffffff"))
+                    else:
+                        tab_button.configure(text_color=self._app_palette["secondary"])
+                except Exception:
+                    pass
+
+            def on_leave(_event: object, name: str = tab_name, tab_button: tk.Widget = button) -> None:
+                try:
+                    if tab_button.cget("state") == "disabled":
+                        tab_button.configure(text_color=self._app_palette["muted"])
+                    elif self.notebook.get() == name:
+                        tab_button.configure(text_color=self._app_palette.get("on_accent", "#ffffff"))
+                    else:
+                        tab_button.configure(text_color=self._app_palette["text"])
+                except Exception:
+                    pass
+
+            button.bind("<Enter>", on_enter, add="+")
+            button.bind("<Leave>", on_leave, add="+")
+            self._tab_hover_bound.add(tab_name)
+
+    def _refresh_inspect_button_state(self, *, busy: bool | None = None) -> None:
+        if not hasattr(self, "inspect_btn"):
+            return
+        if busy is None:
+            busy = bool(self._export_thread and self._export_thread.is_alive())
+
+        armed = self._has_valid_input_file and not self._inspect_locked_after_press and not busy
+        self._configure_widget_state(self.inspect_btn, armed)
+        if armed:
+            self._style_secondary_action_button(self.inspect_btn)
+
+    def _style_secondary_action_button(self, button: tk.Widget, *, borderless: bool = False) -> None:
+        _style_secondary_button_for_palette(button, self._app_palette, borderless=borderless)
+
+    def _export_is_running(self) -> bool:
+        return bool(self._export_thread and self._export_thread.is_alive())
+
+    def _is_export_stop_button(self, button: tk.Widget) -> bool:
+        return button is getattr(self, "export_btn", None) and self._export_is_running()
+
+    def _style_export_stop_button(self) -> None:
+        button = getattr(self, "export_btn", None)
+        if button is None:
+            return
+        try:
+            button.configure(
+                text="Stop Preview",
+                command=self._cancel_operations,
+                fg_color=self._app_palette["danger"],
+                hover_color=self._app_palette["danger_hover"],
+                text_color=self._app_palette["on_danger"],
+                border_width=1,
+                border_color=self._app_palette["danger"],
+            )
+        except Exception:
+            pass
+
+    def _bind_secondary_press_feedback(self, button: tk.Widget) -> None:
+        def reset() -> None:
+            if self._is_export_stop_button(button):
+                self._style_export_stop_button()
+            else:
+                self._style_secondary_action_button(button)
+
+        _bind_secondary_button_feedback(button, lambda: self._app_palette, reset_callback=reset)
+
+    def _sync_right_panel_title_colors(self) -> None:
+        for attr in ("runtime_title_label", "event_log_label"):
+            widget = getattr(self, attr, None)
+            if widget is None:
+                continue
+            try:
+                widget.configure(state="normal", text_color=self._app_palette["secondary"])
+            except Exception:
+                pass
+
+    def _set_inspect_loading(self, loading: bool) -> None:
+        indicator = getattr(self, "inspect_loading_label", None)
+        if indicator is None:
+            return
+
+        if loading:
+            try:
+                indicator.configure(text="⟳ Inspecting...", text_color=self._app_palette["secondary"])
+                if not indicator.winfo_manager():
+                    indicator.pack(side="left", padx=(12, 0))
+                indicator.lift()
+                self.status_var.set("Inspecting dataset...")
+                self.update()
+            except Exception:
+                pass
+            return
+
+        try:
+            indicator.pack_forget()
+        except Exception:
+            pass
+
+    def _on_export_button(self) -> None:
+        if self._export_thread and self._export_thread.is_alive():
+            self._cancel_operations()
+            return
+        self._on_export()
+
+    def _sync_export_button_state(self, *, busy: bool, enabled: bool) -> None:
+        button = getattr(self, "export_btn", None)
+        if button is None:
+            return
+        try:
+            if busy:
+                self._configure_widget_state(button, True)
+                self._style_export_stop_button()
+            else:
+                button.configure(text="Build Viewer", command=self._on_export_button)
+                self._configure_widget_state(button, enabled)
+                if enabled:
+                    self._style_secondary_action_button(button)
+        except Exception:
+            pass
+
+    def _cancel_operations(self) -> None:
+        self._cancel_requested.set()
+        if self._server is not None:
+            self._stop_server()
+        if self._export_thread and self._export_thread.is_alive():
+            self.status_var.set("Cancel requested")
+            self._log("Cancel requested. Current export step will stop at the next safe checkpoint.")
+        else:
+            self.status_var.set("Ready")
+
+    def _refresh_right_panel_gate(self) -> None:
+        inspected = bool(self._has_inspected_input_file)
+        side_outer = getattr(self, "side_outer", None)
+        if side_outer is not None:
+            try:
+                if inspected:
+                    side_outer.configure(**self._theme["card_frame"])
+                else:
+                    side_outer.configure(
+                        fg_color=self._app_palette["hover_bg"],
+                        border_color=self._app_palette["border"],
+                    )
+            except Exception:
+                pass
+
+        for widget in self._right_panel_widgets:
+            self._configure_widget_state(widget, inspected)
+        self._sync_right_panel_title_colors()
+
+        if hasattr(self, "progress"):
+            try:
+                if inspected:
+                    self.progress.configure(**self._theme["progress"])
+                else:
+                    self.progress.configure(
+                        fg_color=self._app_palette["hover_bg"],
+                        progress_color=self._app_palette["muted"],
+                    )
+            except Exception:
+                pass
+        if hasattr(self, "log_text"):
+            try:
+                self.log_text.configure(state="disabled")
+                if inspected:
+                    self.log_text.configure(**self._theme["textbox"])
+                else:
+                    self.log_text.configure(
+                        fg_color=self._app_palette["hover_bg"],
+                        text_color=self._app_palette["muted"],
+                        border_color=self._app_palette["secondary"],
+                    )
+            except Exception:
+                pass
+        self._sync_runtime_chip()
+
+    def _clear_inspection_metadata(self) -> None:
+        self._inspected_h5ad_path = None
+        self._inspected_var_name_set = None
+        self._inspected_coords_mode = None
+        self._inspected_n_cells = None
+        self._inspected_n_genes = None
+        self._inspected_obs_cols = set()
+        self._inspected_section_counts_by_column = {}
+
+    @staticmethod
+    def _format_count(value: int) -> str:
+        return f"{int(value):,}"
+
+    def _estimate_exported_gene_count(self) -> tuple[int | None, str | None]:
+        total_genes = self._inspected_n_genes
+        if total_genes is None:
+            return None, "dataset gene count is unknown"
+
+        genes = self.manual_genes_editor.get_items() if hasattr(self, "manual_genes_editor") else []
+        if self.selection_mode_var.get() and hasattr(self, "selection_genes_picker"):
+            selected = self.selection_genes_picker.get_selected()
+            if selected:
+                genes = selected
+        count = len(self._merge_unique(genes))
+        if count <= 0:
+            return None, "add at least one feature"
+        return min(total_genes, count), None
+
+    def _get_section_counts_for_estimate(self, column: str) -> list[int] | None:
+        if not column or column not in self._inspected_obs_cols:
+            return None
+        cached = self._inspected_section_counts_by_column.get(column)
+        if cached is not None:
+            return cached
+        path = self._inspected_h5ad_path
+        if path is None or not path.exists():
+            return None
+
+        adata = None
+        try:
+            ad_mod = _get_anndata()
+            try:
+                adata = ad_mod.read_h5ad(path, backed="r")
+            except Exception:
+                adata = ad_mod.read_h5ad(path)
+            counts = [int(value) for value in adata.obs[column].value_counts(dropna=False).tolist()]
+            self._inspected_section_counts_by_column[column] = counts
+            return counts
+        except Exception:
+            return None
+        finally:
+            if adata is not None and getattr(adata, "isbacked", False):
+                file_obj = getattr(adata, "file", None)
+                if file_obj is not None:
+                    file_obj.close()
+
+    def _estimate_exported_cell_count(self) -> tuple[int | None, str | None]:
+        total_cells = self._inspected_n_cells
+        if total_cells is None:
+            return None, "dataset cell count is unknown"
+
+        downsample_text = self.downsample_var.get().strip()
+        if not downsample_text:
+            return total_cells, None
+        try:
+            downsample = int(downsample_text)
+        except ValueError:
+            return None, "enter a valid downsample value"
+        if downsample <= 0:
+            return None, "enter a positive downsample value"
+
+        groupby = self.section_groupby_var.get().strip()
+        counts = self._get_section_counts_for_estimate(groupby)
+        if counts:
+            return sum(min(count, downsample) for count in counts), None
+        return min(total_cells, downsample), f"section counts unavailable for '{groupby}'"
+
+    def _update_export_estimate(self) -> None:
+        if not hasattr(self, "export_estimate_summary_label"):
+            return
+
+        if not self._has_inspected_input_file or self._inspected_n_cells is None or self._inspected_n_genes is None:
+            self.export_estimate_summary_label.configure(
+                text="Inspect a dataset to estimate exported cells, genes, elements, and HTML size.",
+                text_color=self._app_palette["text"],
+            )
+            self.export_estimate_warning_label.configure(text="", text_color=self._app_palette["muted"])
+            return
+
+        cells, cell_note = self._estimate_exported_cell_count()
+        genes, gene_note = self._estimate_exported_gene_count()
+        notes = [note for note in (cell_note, gene_note) if note]
+        if cells is None or genes is None:
+            note = "; ".join(notes) if notes else "complete the export settings"
+            self.export_estimate_summary_label.configure(
+                text=f"Estimate waiting for valid settings: {note}.",
+                text_color=self._app_palette["text"],
+            )
+            self.export_estimate_warning_label.configure(text="", text_color=self._app_palette["muted"])
+            return
+
+        elements = int(cells) * int(genes)
+        predicted_mb = self._HTML_SIZE_MB_PER_ELEMENT * elements
+        summary = (
+            f"Export estimate: {self._format_count(cells)} cells x {self._format_count(genes)} genes = "
+            f"{self._format_count(elements)} elements. Predicted HTML size: {predicted_mb:,.1f} MB. "
+            "Expected if genes are selected at random. HTML file size will drastically increase if top_genes are selected (dense matrix)."
+        )
+        if notes:
+            summary = f"{summary} Note: {'; '.join(notes)}."
+        self.export_estimate_summary_label.configure(text=summary, text_color=self._app_palette["text"])
+
+        if elements > self._HTML_SIZE_WARNING_ELEMENTS:
+            self.export_estimate_warning_label.configure(
+                text=(
+                    "Warning: more than 150 million exported entries. Builder will probably generate an HTML file "
+                    ">500 MB, and the browser may not be able to display such a big HTML file."
+                ),
+                text_color=self._app_palette["danger"],
+            )
+        else:
+            self.export_estimate_warning_label.configure(text="", text_color=self._app_palette["muted"])
+
+    def _refresh_input_gate(self) -> None:
+        valid_path = self._valid_h5ad_path()
+        has_valid_input = valid_path is not None
+        if has_valid_input != self._has_valid_input_file:
+            self._has_valid_input_file = has_valid_input
+        input_changed = (
+            valid_path is not None
+            and self._inspected_h5ad_path is not None
+            and self._inspected_h5ad_path != valid_path
+        )
+        if not has_valid_input or input_changed:
+            self._has_inspected_input_file = False
+            self._clear_inspection_metadata()
+
+        busy = bool(self._export_thread and self._export_thread.is_alive())
+        enabled = has_valid_input and self._has_inspected_input_file and not busy
+        self._set_widgets_visible(self._inspection_gated_widgets, self._has_inspected_input_file)
+
+        for attr in (
+            "coords_menu",
+            "spatialdata_table_entry",
+            "groupby_combo",
+            "color_combo",
+            "numba_jit_check",
+            "outline_combo",
+            "title_entry",
+            "downsample_entry",
+        ):
+            self._configure_widget_state(getattr(self, attr, None), enabled)
+
+        self._sync_export_button_state(busy=busy, enabled=enabled)
+        self._configure_widget_state(getattr(self, "inspect_btn", None), has_valid_input and not busy)
+        self._refresh_inspect_button_state(busy=busy)
+        self._configure_widget_state(getattr(self, "open_output_btn", None), self._has_inspected_input_file and not busy)
+        self._configure_widget_state(getattr(self, "open_viewer_btn", None), self._has_inspected_input_file and not busy)
+
+        self._refresh_tab_gate()
+        self._refresh_right_panel_gate()
+        self._update_export_estimate()
 
     def _sync_runtime_chip(self) -> None:
         if not hasattr(self, "runtime_chip_label"):
@@ -904,36 +1746,78 @@ class ExportApp(ctk.CTk if ctk is not None else object):
             tc = "#ffffff"
         else:
             text = "READY"
-            fg = self._app_palette["hover_bg"]
+            fg = self._theme["progress"]["fg_color"]
             tc = self._app_palette["text"]
-        self.runtime_chip_label.configure(text=text, fg_color=fg, text_color=tc)
+        self.runtime_chip_label.configure(
+            text=text,
+            fg_color=fg,
+            text_color=tc,
+            border_width=0,
+        )
 
     def _build_variables(self) -> None:
         self.h5ad_var = tk.StringVar()
         self.outdir_var = tk.StringVar()
         self.coords_var = tk.StringVar(value="auto")
+        self.spatialdata_table_var = tk.StringVar()
         self.section_groupby_var = tk.StringVar(value="sample_id")
+        self.section_order_var = tk.StringVar()
+        self.metadata_value_order_var = tk.StringVar()
+        self.metadata_max_columns_var = tk.StringVar()
         self.initial_color_var = tk.StringVar(value="leiden")
         self.title_var = tk.StringVar(value="KaroSpace")
         self.theme_var = tk.StringVar(value="dark")
         self.numba_jit_var = tk.BooleanVar(value=False)
         self.outline_by_var = tk.StringVar(value="condition")
+        self.metadata_labels_var = tk.StringVar()
+        self.viewer_info_html_file_var = tk.StringVar()
+        self.tutorial_var = tk.BooleanVar(value=False)
 
-        self.genes_mode_var = tk.StringVar(value="hvgs")
-        self.genes_count_var = tk.StringVar(value="500")
-        self.gene_list_path_var = tk.StringVar()
-        self.advanced_open_var = tk.BooleanVar(value=False)
+        self.feature_encoding_var = tk.StringVar(value="auto")
+        self.feature_value_encoding_var = tk.StringVar(value="uint16")
+        self.feature_storage_var = tk.StringVar(value="embedded")
+        self.feature_manifest_path_var = tk.StringVar()
+        self.feature_sidecar_shard_size_var = tk.StringVar(value="256")
+        self.feature_sparse_zero_threshold_var = tk.StringVar(value="0.8")
+        self.modalities_var = tk.StringVar()
         self.min_panel_size_var = tk.StringVar(value="120")
         self.spot_size_var = tk.StringVar(value="auto")
-        self.marker_genes_top_n_var = tk.StringVar(value="50")
+        self.pseudobulk_embed_top_n_per_comparison_var = tk.StringVar(value="20")
         self.neighbor_permutations_var = tk.StringVar(value="25")
         self.neighbor_stats_seed_var = tk.StringVar(value="42")
         self.neighbor_auto_var = tk.BooleanVar(value=True)
+        self.pseudobulk_enabled_var = tk.BooleanVar(value=True)
+        self.pseudobulk_replicate_annotation_var = tk.StringVar()
+        self.pseudobulk_simple_constrast_categories_var = tk.StringVar()
+        self.pseudobulk_counts_layer_var = tk.StringVar(value="counts")
+        self.pseudobulk_min_cell_counts_var = tk.StringVar(value="0")
+        self.pseudobulk_min_gene_counts_var = tk.StringVar(value="0")
+        self.pseudobulk_min_cells_per_pseudobulk_var = tk.StringVar(value="20")
+        self.pseudobulk_min_replicates_var = tk.StringVar(value="2")
+        self.pseudobulk_min_pct_expressed_var = tk.StringVar(value="0")
+        self.pseudobulk_p_adjust_method_var = tk.StringVar(value="fdr_bh")
+        self.pseudobulk_padj_cutoff_var = tk.StringVar(value="0.05")
+        self.pseudobulk_log2fc_cutoff_var = tk.StringVar(value="0.5")
+        self.pseudobulk_deseq2_fit_type_var = tk.StringVar(value="parametric")
+        self.pseudobulk_n_cpus_var = tk.StringVar(value="1")
+        self.pathway_gmt_var = tk.StringVar()
+        self.pathway_organism_var = tk.StringVar(value="Human")
+        self.pathway_top_n_var = tk.StringVar(value="20")
+        self.pathway_min_overlap_var = tk.StringVar(value="3")
+        self.pathway_gsea_permutations_var = tk.StringVar(value="100")
         self.interaction_markers_enabled_var = tk.BooleanVar(value=False)
         self.interaction_markers_top_targets_var = tk.StringVar(value="6")
         self.interaction_markers_top_genes_var = tk.StringVar(value="15")
         self.interaction_markers_min_cells_var = tk.StringVar(value="30")
         self.interaction_markers_min_neighbors_var = tk.StringVar(value="1")
+        self.section_rotations_var = tk.StringVar()
+        self.deconvolutions_var = tk.StringVar()
+        self.gene_correlation_top_n_var = tk.StringVar(value="10")
+        self.category_means_n_genes_var = tk.StringVar(value="500")
+        self.spatial_variable_genes_n_var = tk.StringVar(value="200")
+        self.scalebar_unit_var = tk.StringVar(value="um")
+        self.section_images_var = tk.StringVar()
+        self.section_images_max_px_var = tk.StringVar(value="4096")
         self.selection_mode_var = tk.BooleanVar(value=False)
 
         self.downsample_var = tk.StringVar()
@@ -959,31 +1843,36 @@ class ExportApp(ctk.CTk if ctk is not None else object):
         self.main_scroll_frame = root
         self._register_theme_widget("root_frame", root)
         root.grid(row=0, column=0, sticky="nsew", padx=16, pady=16)
-        root.columnconfigure(0, weight=3)
-        root.columnconfigure(1, weight=2)
+        root.columnconfigure(0, weight=3, minsize=730, uniform="main_columns")
+        root.columnconfigure(1, weight=2, minsize=430, uniform="main_columns")
         root.rowconfigure(0, weight=1)
 
-        controls = ctk.CTkFrame(root, **self._theme["card_frame"])
+        controls = ctk.CTkFrame(root, width=730, **self._theme["card_frame"])
         self._register_theme_widget("card_frame", controls)
         controls.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        controls.columnconfigure(0, weight=1)
+        controls.rowconfigure(1, weight=1)
+        controls_outer = controls
 
-        side = ctk.CTkFrame(root, **self._theme["card_frame"])
+        side = ctk.CTkFrame(root, width=430, **self._theme["card_frame"])
         self._register_theme_widget("card_frame", side)
         side.grid(row=0, column=1, sticky="nsew")
 
         controls_inner = ctk.CTkFrame(controls, **self._theme["sub_frame"])
         self._register_theme_widget("sub_frame", controls_inner)
-        controls_inner.pack(fill="both", expand=True, padx=22, pady=22)
+        controls_inner.grid(row=0, column=0, sticky="ew", padx=22, pady=(22, 8))
         controls = controls_inner
 
         side_inner = ctk.CTkFrame(side, **self._theme["sub_frame"])
+        self.side_outer = side
+        self.side_panel = side_inner
         self._register_theme_widget("sub_frame", side_inner)
         side_inner.pack(fill="both", expand=True, padx=22, pady=22)
         side = side_inner
 
         controls.columnconfigure(1, weight=1)
         side.columnconfigure(0, weight=1)
-        side.rowconfigure(6, weight=1)
+        side.rowconfigure(3, weight=1)
 
         hero = ctk.CTkFrame(controls, **self._theme["hero_card"])
         self._register_theme_widget("hero_card", hero)
@@ -1003,59 +1892,124 @@ class ExportApp(ctk.CTk if ctk is not None else object):
             "Export AnnData into a static KaroSpace viewer bundle with guided inputs and inspected field pickers.",
         ).pack(anchor="w", pady=(4, 0))
 
-        self._divider(controls, height=1).grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 14))
+        tabs_toolbar = self._make_sub_frame(controls)
+        self.tabs_toolbar = tabs_toolbar
+        tabs_toolbar.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        tabs_toolbar.columnconfigure(0, weight=1)
 
-        notebook = ctk.CTkTabview(controls, **self._theme["tabview"])
+        self.theme_toggle_btn = self._secondary_button(tabs_toolbar, "☀", self._toggle_theme, width=42)
+        self.theme_toggle_btn.grid(row=0, column=1, sticky="e", padx=(0, 8))
+        self.guide_btn = self._secondary_button(tabs_toolbar, "?", self._show_guide_popup, width=42)
+        self.guide_btn.grid(row=0, column=2, sticky="e")
+
+        self._path_field(controls, 2, "Input file", self.h5ad_var, choose_file=True)
+
+        notebook = ctk.CTkTabview(controls_outer, command=self._on_tab_selected, width=1, **self._theme["tabview"])
+        self.notebook = notebook
+        self._last_enabled_tab = "Basic"
         self._register_theme_widget("tabview", notebook)
-        notebook.grid(row=2, column=0, columnspan=3, sticky="nsew")
-        controls.rowconfigure(2, weight=1)
+        notebook.grid(row=1, column=0, sticky="ew", padx=18)
+        self._inspection_gated_widgets.append(notebook)
+        controls_outer.rowconfigure(1, weight=0)
 
         notebook.add("Basic")
-        notebook.add("Colors & Genes")
+        notebook.add("Colors")
+        notebook.add("Genes")
+        notebook.add("Cells")
         notebook.add("Advanced")
-        notebook.add("Help")
         basic_tab = notebook.tab("Basic")
-        colors_tab = notebook.tab("Colors & Genes")
+        colors_tab = notebook.tab("Colors")
+        genes_tab = notebook.tab("Genes")
+        cells_tab = notebook.tab("Cells")
         advanced_tab = notebook.tab("Advanced")
-        help_tab = notebook.tab("Help")
-        for tab in (basic_tab, colors_tab, advanced_tab, help_tab):
+        for tab in (basic_tab, colors_tab, genes_tab, cells_tab, advanced_tab):
             self._register_theme_widget("sub_frame", tab)
 
+        basic_tab_outer = basic_tab
+        colors_tab_outer = colors_tab
+        genes_tab_outer = genes_tab
+        cells_tab_outer = cells_tab
+        advanced_tab_outer = advanced_tab
+        for outer_tab in (basic_tab_outer, colors_tab_outer, genes_tab_outer, cells_tab_outer, advanced_tab_outer):
+            outer_tab.columnconfigure(0, weight=1)
+            outer_tab.rowconfigure(0, weight=1)
+
+        basic_tab = self._make_sub_frame(basic_tab_outer)
+        basic_tab.grid(row=0, column=0, sticky="nsew", padx=22, pady=18)
+        colors_tab = self._make_sub_frame(colors_tab_outer)
+        colors_tab.grid(row=0, column=0, sticky="nsew", padx=22, pady=18)
+        genes_tab = self._make_sub_frame(genes_tab_outer)
+        genes_tab.grid(row=0, column=0, sticky="nsew", padx=22, pady=18)
+        cells_tab = self._make_sub_frame(cells_tab_outer)
+        cells_tab.grid(row=0, column=0, sticky="nsew", padx=22, pady=18)
+        advanced_tab = self._make_sub_frame(advanced_tab_outer)
+        advanced_tab.grid(row=0, column=0, sticky="nsew", padx=22, pady=18)
+
         basic_tab.columnconfigure(1, weight=1)
-        self._section_label(basic_tab, "INPUT & VIEWER SETUP").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        self._section_label(basic_tab, "PARAMETERS").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
         self._divider(basic_tab, height=1).grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 12))
         row = 2
-        row = self._path_field(basic_tab, row, "Input .h5ad", self.h5ad_var, choose_file=True)
-        row = self._path_field(basic_tab, row, "Output directory", self.outdir_var, choose_file=False)
         row = self._option_row(
             basic_tab,
             row,
             "Coordinates",
             widget=self._coords_dropdown(basic_tab),
             hint="auto | obsm:spatial | obs:centroid_x_y. obs centroid mode is converted to temporary obsm['spatial'] before KaroSpace export.",
+            gated=True,
+        )
+        self.spatialdata_table_entry = self._entry(basic_tab, self.spatialdata_table_var)
+        row = self._option_row(
+            basic_tab,
+            row,
+            "SpatialData table",
+            widget=self.spatialdata_table_entry,
+            hint="Optional table key for SpatialData .zarr inputs. Leave blank for H5AD.",
+            gated=True,
         )
         row = self._option_row(
             basic_tab,
             row,
-            "Section groupby",
+            "Section key",
             widget=self._groupby_dropdown(basic_tab),
-            hint="obs column used to split sections (same as load_spatial_data(groupby=...)).",
+            hint="obs column used to split sections (load_spatial_data(section_key=...)).",
+            gated=True,
         )
         row = self._option_row(
             basic_tab,
             row,
-            "Initial color",
+            "Main cell annotation",
             widget=self._color_dropdown(basic_tab),
-            hint="Initial viewer color (obs column or gene).",
+            hint="Initial viewer cell annotation (export_to_html(main_cell_annotation=...)).",
+            gated=True,
         )
         row = self._option_row(
             basic_tab,
             row,
-            "Theme",
-            widget=self._theme_dropdown(basic_tab),
-            hint="KaroSpace viewer theme.",
+            "Outline cards by",
+            widget=self._outline_dropdown(basic_tab),
+            hint="Optional metadata column for panel outlines.",
+            gated=True,
         )
+        self._section_label(basic_tab, "HTML VIEWER").grid(row=row, column=0, columnspan=3, sticky="w", pady=(10, 8))
+        row += 1
+        self._divider(basic_tab, height=1).grid(row=row, column=0, columnspan=3, sticky="ew", pady=(0, 12))
+        row += 1
+        row = self._path_field(basic_tab, row, "Output directory", self.outdir_var, choose_file=False, gated=True)
+        self.title_entry = self._entry(basic_tab, self.title_var)
+        row = self._option_row(
+            basic_tab,
+            row,
+            "Viewer title",
+            widget=self.title_entry,
+            hint="Title shown in the exported HTML.",
+            gated=True,
+        )
+        self._section_label(basic_tab, "RUNTIME").grid(row=row, column=0, columnspan=3, sticky="w", pady=(10, 8))
+        row += 1
+        self._divider(basic_tab, height=1).grid(row=row, column=0, columnspan=3, sticky="ew", pady=(0, 12))
+        row += 1
         runtime_mode_row = self._make_sub_frame(basic_tab)
+        self.runtime_mode_row = runtime_mode_row
         self.numba_jit_check = ctk.CTkCheckBox(
             runtime_mode_row,
             text="Performance mode (enable numba JIT)",
@@ -1070,39 +2024,56 @@ class ExportApp(ctk.CTk if ctk is not None else object):
             "Runtime mode",
             widget=runtime_mode_row,
             hint="Faster on some datasets. If unstable in the desktop app, turn this off.",
+            gated=True,
         )
-        row = self._option_row(
-            basic_tab,
-            row,
-            "Outline by",
-            widget=self._outline_dropdown(basic_tab),
-            hint="Optional metadata column for panel outlines.",
+        self.estimate_card = ctk.CTkFrame(basic_tab, **self._theme["highlight_card"])
+        self._register_theme_widget("highlight_card", self.estimate_card)
+        self.estimate_card.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(0, 12))
+        self.estimate_card.columnconfigure(0, weight=1)
+
+        estimate_inner = self._make_sub_frame(self.estimate_card)
+        estimate_inner.grid(row=0, column=0, sticky="ew", padx=14, pady=12)
+        estimate_inner.columnconfigure(0, weight=1)
+        self.export_estimate_title_label = self._section_label(estimate_inner, "EXPORT ESTIMATE")
+        self.export_estimate_title_label.grid(row=0, column=0, sticky="w")
+        self.export_estimate_summary_label = self._body_label(
+            estimate_inner,
+            "Inspect a dataset to estimate exported cells, genes, elements, and HTML size.",
         )
-        row = self._option_row(
-            basic_tab,
-            row,
-            "Viewer title",
-            widget=self._entry(basic_tab, self.title_var),
-            hint="Title shown in the exported HTML.",
-        )
-        downsample_container = self._make_sub_frame(basic_tab)
+        self.export_estimate_summary_label.configure(wraplength=690, justify="left")
+        self.export_estimate_summary_label.grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.export_estimate_warning_label = self._subheader_label(estimate_inner, "")
+        self.export_estimate_warning_label.configure(wraplength=690, justify="left")
+        self.export_estimate_warning_label.grid(row=2, column=0, sticky="w", pady=(4, 0))
+        row += 1
+
+        cells_tab.columnconfigure(1, weight=1)
+        self._section_label(cells_tab, "CELL SOURCES").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        self._subheader_label(
+            cells_tab,
+            "Configure cell-level export volume.",
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        self._divider(cells_tab, height=1).grid(row=2, column=0, columnspan=3, sticky="ew", pady=(0, 10))
+        downsample_container = self._make_sub_frame(cells_tab)
         downsample_entry = ctk.CTkEntry(downsample_container, textvariable=self.downsample_var, width=100, **self._theme["entry"])
+        self.downsample_entry = downsample_entry
         self._register_entry_widget(downsample_entry)
         downsample_entry.pack(side="left")
         self._body_label(downsample_container, "cells per section (blank = all)").pack(side="left", padx=(8, 0))
         self._option_row(
-            basic_tab,
-            row,
+            cells_tab,
+            3,
             "Downsample",
             widget=downsample_container,
             hint="Maps to export_to_html(downsample=...).",
+            gated=True,
         )
 
         colors_tab.columnconfigure(0, weight=1)
-        self._section_label(colors_tab, "COLOR FIELDS & GENE SOURCES").grid(row=0, column=0, sticky="w", pady=(0, 6))
+        self._section_label(colors_tab, "COLOR FIELDS").grid(row=0, column=0, sticky="w", pady=(0, 6))
         self._subheader_label(
             colors_tab,
-            "Build color menus and gene features from inspected obs/var fields.",
+            "Build color menus from inspected obs fields.",
         ).grid(row=1, column=0, sticky="w", pady=(0, 8))
         self._divider(colors_tab, height=1).grid(row=2, column=0, sticky="ew", pady=(0, 10))
         self.additional_colors_editor = SearchableListEditor(
@@ -1116,41 +2087,146 @@ class ExportApp(ctk.CTk if ctk is not None else object):
 
         self.groupby_editor = SearchableListEditor(
             colors_tab,
-            label="groupby lists (marker/neighbor/interaction)",
+            label="analysis annotations (pseudobulk/neighbor/interaction)",
             height=6,
-            help_text="Used for marker_genes_groupby and optionally neighbor/interaction groupby.",
+            help_text="Used for pseudobulk_additional_annotations and optionally neighbor stats annotations.",
             palette=self._app_palette,
         )
         self.groupby_editor.grid(row=4, column=0, sticky="ew", pady=(0, 12))
 
-        genes_card = ctk.CTkFrame(colors_tab, **self._theme["card_frame"])
+        self.section_metadata_editor = SearchableListEditor(
+            colors_tab,
+            label="section_metadata (filter chips)",
+            height=5,
+            help_text="Section-level obs fields shown in the visual params bar/filter chips.",
+            palette=self._app_palette,
+        )
+        self.section_metadata_editor.grid(row=5, column=0, sticky="ew", pady=(0, 10))
+
+        self.section_metadata_extra_editor = SearchableListEditor(
+            colors_tab,
+            label="section_metadata_extra (stored only)",
+            height=5,
+            help_text="Section-level obs fields stored in the payload without filter chips.",
+            palette=self._app_palette,
+        )
+        self.section_metadata_extra_editor.grid(row=6, column=0, sticky="ew", pady=(0, 12))
+
+        genes_tab.columnconfigure(0, weight=1)
+        self._section_label(genes_tab, "GENE SOURCES").grid(row=0, column=0, sticky="w", pady=(0, 6))
+        self._subheader_label(
+            genes_tab,
+            "Select feature vectors from inspected var_names.",
+        ).grid(row=1, column=0, sticky="w", pady=(0, 8))
+        self._divider(genes_tab, height=1).grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        genes_card = ctk.CTkFrame(genes_tab, **self._theme["card_frame"])
         self._register_theme_widget("card_frame", genes_card)
-        genes_card.grid(row=5, column=0, sticky="ew")
+        genes_card.grid(row=3, column=0, sticky="ew")
         genes_card.columnconfigure(0, weight=1)
         genes_inner = self._make_sub_frame(genes_card)
         genes_inner.grid(row=0, column=0, sticky="ew", padx=12, pady=12)
         genes_inner.columnconfigure(0, weight=1)
-        self._field_label(genes_inner, "Gene Selection").grid(row=0, column=0, sticky="w", pady=(0, 6))
-        self._genes_mode_row(genes_inner).grid(row=1, column=0, sticky="ew")
+        self._field_label(genes_inner, "Feature Selection").grid(row=0, column=0, sticky="w", pady=(0, 6))
         self._subheader_label(
             genes_inner,
-            (
-                "hvgs:N maps to use_hvgs=True/hvg_limit=N. top_mean/list_file/manual_list map to explicit genes list "
-                "with use_hvgs=False."
-            ),
-        ).grid(row=2, column=0, sticky="w", pady=(4, 8))
+            "Selected var_names are passed directly to export_to_html(features=[...]).",
+        ).grid(row=1, column=0, sticky="w", pady=(0, 8))
+
+        feature_storage_row = self._make_sub_frame(genes_inner)
+        feature_storage_row.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        self._body_label(feature_storage_row, "Storage").pack(side="left")
+        self.feature_storage_combo = ctk.CTkComboBox(
+            feature_storage_row,
+            variable=self.feature_storage_var,
+            values=["embedded", "sidecar"],
+            width=120,
+            state="readonly",
+            **self._theme["combo"],
+        )
+        self._register_combo_widget(self.feature_storage_combo)
+        self.feature_storage_combo.pack(side="left", padx=(6, 12))
+        self._body_label(feature_storage_row, "Encoding").pack(side="left")
+        self.feature_encoding_combo = ctk.CTkComboBox(
+            feature_storage_row,
+            variable=self.feature_encoding_var,
+            values=["auto", "dense", "sparse"],
+            width=110,
+            state="readonly",
+            **self._theme["combo"],
+        )
+        self._register_combo_widget(self.feature_encoding_combo)
+        self.feature_encoding_combo.pack(side="left", padx=(6, 12))
+        self._body_label(feature_storage_row, "Value").pack(side="left")
+        self.feature_value_encoding_combo = ctk.CTkComboBox(
+            feature_storage_row,
+            variable=self.feature_value_encoding_var,
+            values=["uint16", "uint8"],
+            width=100,
+            state="readonly",
+            **self._theme["combo"],
+        )
+        self._register_combo_widget(self.feature_value_encoding_combo)
+        self.feature_value_encoding_combo.pack(side="left", padx=(6, 0))
+
+        feature_options_row = self._make_sub_frame(genes_inner)
+        feature_options_row.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        self._body_label(feature_options_row, "Manifest").pack(side="left")
+        self.feature_manifest_entry = ctk.CTkEntry(
+            feature_options_row,
+            textvariable=self.feature_manifest_path_var,
+            width=170,
+            **self._theme["entry"],
+        )
+        self._register_entry_widget(self.feature_manifest_entry)
+        self.feature_manifest_entry.pack(side="left", padx=(6, 12))
+        self._body_label(feature_options_row, "Shard").pack(side="left")
+        self.feature_sidecar_shard_entry = ctk.CTkEntry(
+            feature_options_row,
+            textvariable=self.feature_sidecar_shard_size_var,
+            width=70,
+            **self._theme["entry"],
+        )
+        self._register_entry_widget(self.feature_sidecar_shard_entry)
+        self.feature_sidecar_shard_entry.pack(side="left", padx=(6, 12))
+        self._body_label(feature_options_row, "Sparse >= ").pack(side="left")
+        self.feature_sparse_zero_threshold_entry = ctk.CTkEntry(
+            feature_options_row,
+            textvariable=self.feature_sparse_zero_threshold_var,
+            width=70,
+            **self._theme["entry"],
+        )
+        self._register_entry_widget(self.feature_sparse_zero_threshold_entry)
+        self.feature_sparse_zero_threshold_entry.pack(side="left", padx=(6, 0))
+
+        modalities_row = self._make_sub_frame(genes_inner)
+        modalities_row.grid(row=4, column=0, sticky="ew", pady=(0, 8))
+        self._body_label(modalities_row, "Modalities").pack(side="left")
+        self.modalities_entry = ctk.CTkEntry(
+            modalities_row,
+            textvariable=self.modalities_var,
+            width=260,
+            **self._theme["entry"],
+        )
+        self._register_entry_widget(self.modalities_entry)
+        self.modalities_entry.pack(side="left", padx=(6, 0))
+        self._subheader_label(
+            modalities_row,
+            "comma-separated; non-default modalities require sidecar",
+        ).pack(side="left", padx=(8, 0))
+
         self.manual_genes_editor = SearchableListEditor(
             genes_inner,
-            label="genes list (manual_list)",
+            label="features",
             height=8,
-            help_text="Search var_names and build the genes list with + Add / Remove.",
+            help_text="Search var_names and build the exported feature list with + Add / Remove.",
             palette=self._app_palette,
+            on_change=self._update_export_estimate,
         )
-        self.manual_genes_editor.grid(row=3, column=0, sticky="ew")
+        self.manual_genes_editor.grid(row=5, column=0, sticky="ew")
 
-        selection_card = ctk.CTkFrame(colors_tab, **self._theme["card_frame"])
+        selection_card = ctk.CTkFrame(genes_tab, **self._theme["card_frame"])
         self._register_theme_widget("card_frame", selection_card)
-        selection_card.grid(row=6, column=0, sticky="ew", pady=(12, 0))
+        selection_card.grid(row=4, column=0, sticky="ew", pady=(12, 0))
         selection_card.columnconfigure(0, weight=1)
 
         selection_inner = self._make_sub_frame(selection_card)
@@ -1168,7 +2244,7 @@ class ExportApp(ctk.CTk if ctk is not None else object):
             selection_inner,
             (
                 "When enabled, selected items below are used during export for additional colors, "
-                "groupby lists, and manual genes."
+                "groupby lists, and features."
             ),
         ).grid(row=1, column=0, sticky="w", pady=(4, 8))
 
@@ -1197,9 +2273,9 @@ class ExportApp(ctk.CTk if ctk is not None else object):
 
         self.selection_genes_picker = SearchableMultiSelectEditor(
             self.selection_mode_content,
-            label="Tick genes (manual_list mode)",
+            label="Tick features",
             height=8,
-            help_text="Multi-select genes from var_names. Used when genes mode is manual_list.",
+            help_text="Multi-select features from var_names.",
             palette=self._app_palette,
         )
         self.selection_genes_picker.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
@@ -1228,17 +2304,8 @@ class ExportApp(ctk.CTk if ctk is not None else object):
             "Fine tune marker, neighbor, interaction, and preview server behavior.",
         ).grid(row=1, column=0, sticky="w", pady=(0, 8))
         self._divider(advanced_tab, height=1).grid(row=2, column=0, sticky="ew", pady=(0, 10))
-        adv_header = self._make_sub_frame(advanced_tab)
-        adv_header.grid(row=3, column=0, sticky="ew")
-        self.advanced_toggle_btn = self._secondary_button(adv_header, "Show Advanced Options", self._toggle_advanced, width=190)
-        self.advanced_toggle_btn.pack(anchor="w")
-        self._subheader_label(
-            adv_header,
-            "Analytics and rendering parameters from KaroSpace export_to_html.",
-        ).pack(anchor="w", pady=(6, 0))
-
         self.advanced_content = self._make_sub_frame(advanced_tab)
-        self.advanced_content.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        self.advanced_content.grid(row=3, column=0, sticky="ew")
         self.advanced_content.columnconfigure(1, weight=1)
 
         min_panel_row = self._make_sub_frame(self.advanced_content)
@@ -1275,16 +2342,21 @@ class ExportApp(ctk.CTk if ctk is not None else object):
         )
 
         marker_row = self._make_sub_frame(self.advanced_content)
-        marker_top_n_entry = ctk.CTkEntry(marker_row, textvariable=self.marker_genes_top_n_var, width=90, **self._theme["entry"])
+        marker_top_n_entry = ctk.CTkEntry(
+            marker_row,
+            textvariable=self.pseudobulk_embed_top_n_per_comparison_var,
+            width=90,
+            **self._theme["entry"],
+        )
         self._register_entry_widget(marker_top_n_entry)
         marker_top_n_entry.pack(side="left")
-        self._body_label(marker_row, "top genes per group").pack(side="left", padx=(8, 0))
+        self._body_label(marker_row, "significant DE genes per comparison").pack(side="left", padx=(8, 0))
         self._option_row(
             self.advanced_content,
             4,
-            "Marker genes top N",
+            "Auto-embedded DE genes",
             widget=marker_row,
-            hint="Maps to marker_genes_top_n.",
+            hint="Maps to pseudobulk_embed_top_n_per_comparison in embedded feature mode.",
         )
 
         neighbor_row = self._make_sub_frame(self.advanced_content)
@@ -1309,19 +2381,160 @@ class ExportApp(ctk.CTk if ctk is not None else object):
             6,
             "Neighbor stats",
             widget=neighbor_row,
-            hint="Permutations accepts integer or 'auto'.",
+            hint="Auto neighbor annotations = [main cell annotation]. Otherwise uses analysis annotations.",
         )
+
+        pseudobulk_row_1 = self._make_sub_frame(self.advanced_content)
+        self.pseudobulk_enabled_check = ctk.CTkCheckBox(
+            pseudobulk_row_1,
+            text="Enable category pseudobulk DE",
+            variable=self.pseudobulk_enabled_var,
+            **self._theme["checkbox"],
+        )
+        self._register_checkbox_widget(self.pseudobulk_enabled_check)
+        self.pseudobulk_enabled_check.pack(side="left")
+        self._body_label(pseudobulk_row_1, "Replicate").pack(side="left", padx=(12, 4))
+        self.pseudobulk_replicate_entry = ctk.CTkEntry(
+            pseudobulk_row_1,
+            textvariable=self.pseudobulk_replicate_annotation_var,
+            width=120,
+            **self._theme["entry"],
+        )
+        self._register_entry_widget(self.pseudobulk_replicate_entry)
+        self.pseudobulk_replicate_entry.pack(side="left")
+        self._body_label(pseudobulk_row_1, "Counts layer").pack(side="left", padx=(12, 4))
+        self.pseudobulk_counts_layer_entry = ctk.CTkEntry(
+            pseudobulk_row_1,
+            textvariable=self.pseudobulk_counts_layer_var,
+            width=110,
+            **self._theme["entry"],
+        )
+        self._register_entry_widget(self.pseudobulk_counts_layer_entry)
+        self.pseudobulk_counts_layer_entry.pack(side="left")
+        self._option_row(
+            self.advanced_content,
+            8,
+            "Pseudobulk DE",
+            widget=pseudobulk_row_1,
+            hint="Main cell annotation is included automatically; analysis annotations are added as additional pseudobulk annotations.",
+        )
+
+        pseudobulk_row_2 = self._make_sub_frame(self.advanced_content)
+        for label, variable, width in (
+            ("Min cells/sample", self.pseudobulk_min_cells_per_pseudobulk_var, 70),
+            ("Min reps", self.pseudobulk_min_replicates_var, 58),
+            ("Min pct", self.pseudobulk_min_pct_expressed_var, 62),
+            ("Padj", self.pseudobulk_padj_cutoff_var, 62),
+            ("Log2FC", self.pseudobulk_log2fc_cutoff_var, 62),
+            ("CPUs", self.pseudobulk_n_cpus_var, 54),
+        ):
+            self._body_label(pseudobulk_row_2, label).pack(side="left", padx=(0, 4))
+            entry = ctk.CTkEntry(pseudobulk_row_2, textvariable=variable, width=width, **self._theme["entry"])
+            self._register_entry_widget(entry)
+            entry.pack(side="left", padx=(0, 8))
+        self._option_row(
+            self.advanced_content,
+            9,
+            "Pseudobulk thresholds",
+            widget=pseudobulk_row_2,
+            hint="Also supports cell/gene count filters below through the compact advanced fields.",
+        )
+
+        pseudobulk_row_3 = self._make_sub_frame(self.advanced_content)
+        self._body_label(pseudobulk_row_3, "P adjust").pack(side="left")
+        self.pseudobulk_p_adjust_combo = ctk.CTkComboBox(
+            pseudobulk_row_3,
+            variable=self.pseudobulk_p_adjust_method_var,
+            values=["fdr_bh", "bonferroni", "holm", "none"],
+            width=120,
+            state="readonly",
+            **self._theme["combo"],
+        )
+        self._register_combo_widget(self.pseudobulk_p_adjust_combo)
+        self.pseudobulk_p_adjust_combo.pack(side="left", padx=(6, 12))
+        self._body_label(pseudobulk_row_3, "Fit").pack(side="left")
+        self.pseudobulk_fit_type_combo = ctk.CTkComboBox(
+            pseudobulk_row_3,
+            variable=self.pseudobulk_deseq2_fit_type_var,
+            values=["parametric", "mean"],
+            width=120,
+            state="readonly",
+            **self._theme["combo"],
+        )
+        self._register_combo_widget(self.pseudobulk_fit_type_combo)
+        self.pseudobulk_fit_type_combo.pack(side="left", padx=(6, 12))
+        self._body_label(pseudobulk_row_3, "Min cell counts").pack(side="left")
+        min_cell_counts_entry = ctk.CTkEntry(
+            pseudobulk_row_3,
+            textvariable=self.pseudobulk_min_cell_counts_var,
+            width=70,
+            **self._theme["entry"],
+        )
+        self._register_entry_widget(min_cell_counts_entry)
+        min_cell_counts_entry.pack(side="left", padx=(4, 10))
+        self._body_label(pseudobulk_row_3, "Min gene counts").pack(side="left")
+        min_gene_counts_entry = ctk.CTkEntry(
+            pseudobulk_row_3,
+            textvariable=self.pseudobulk_min_gene_counts_var,
+            width=70,
+            **self._theme["entry"],
+        )
+        self._register_entry_widget(min_gene_counts_entry)
+        min_gene_counts_entry.pack(side="left", padx=(4, 0))
+        self._option_row(
+            self.advanced_content,
+            10,
+            "Pseudobulk fit",
+            widget=pseudobulk_row_3,
+        )
+
+        pathway_row = self._make_sub_frame(self.advanced_content)
+        self._body_label(pathway_row, "Organism").pack(side="left")
+        pathway_organism_entry = ctk.CTkEntry(pathway_row, textvariable=self.pathway_organism_var, width=100, **self._theme["entry"])
+        self._register_entry_widget(pathway_organism_entry)
+        pathway_organism_entry.pack(side="left", padx=(4, 10))
+        self._body_label(pathway_row, "Top N").pack(side="left")
+        pathway_top_entry = ctk.CTkEntry(pathway_row, textvariable=self.pathway_top_n_var, width=58, **self._theme["entry"])
+        self._register_entry_widget(pathway_top_entry)
+        pathway_top_entry.pack(side="left", padx=(4, 10))
+        self._body_label(pathway_row, "Min overlap").pack(side="left")
+        pathway_overlap_entry = ctk.CTkEntry(pathway_row, textvariable=self.pathway_min_overlap_var, width=58, **self._theme["entry"])
+        self._register_entry_widget(pathway_overlap_entry)
+        pathway_overlap_entry.pack(side="left", padx=(4, 10))
+        self._body_label(pathway_row, "GSEA perms").pack(side="left")
+        pathway_perm_entry = ctk.CTkEntry(pathway_row, textvariable=self.pathway_gsea_permutations_var, width=70, **self._theme["entry"])
+        self._register_entry_widget(pathway_perm_entry)
+        pathway_perm_entry.pack(side="left", padx=(4, 0))
+        self._option_row(
+            self.advanced_content,
+            11,
+            "Pathways",
+            widget=pathway_row,
+            hint="GMT files can be supplied below as comma-separated paths; blank uses KaroSpace defaults.",
+        )
+
+        pathway_gmt_row = self._make_sub_frame(self.advanced_content)
+        pathway_gmt_entry = ctk.CTkEntry(pathway_gmt_row, textvariable=self.pathway_gmt_var, **self._theme["entry"])
+        self._register_entry_widget(pathway_gmt_entry)
+        pathway_gmt_entry.pack(side="left", fill="x", expand=True)
+        self._option_row(self.advanced_content, 12, "Pathway GMT", widget=pathway_gmt_row)
 
         interaction_row_1 = self._make_sub_frame(self.advanced_content)
         self.interaction_enabled_check = ctk.CTkCheckBox(
             interaction_row_1,
-            text="Enable interaction markers (uses groupby list)",
+            text="Enable interaction markers",
             variable=self.interaction_markers_enabled_var,
             **self._theme["checkbox"],
         )
         self._register_checkbox_widget(self.interaction_enabled_check)
         self.interaction_enabled_check.pack(side="left")
-        self._option_row(self.advanced_content, 8, "Interaction markers", widget=interaction_row_1)
+        self._option_row(
+            self.advanced_content,
+            13,
+            "Interaction markers",
+            widget=interaction_row_1,
+            hint="Uses main cell annotation and pseudobulk additional annotations.",
+        )
 
         interaction_row_2 = self._make_sub_frame(self.advanced_content)
         self._body_label(interaction_row_2, "Top targets").pack(side="left")
@@ -1362,10 +2575,122 @@ class ExportApp(ctk.CTk if ctk is not None else object):
         interaction_min_neighbors_entry.pack(side="left", padx=(4, 0))
         self._option_row(
             self.advanced_content,
-            9,
+            14,
             "Interaction limits",
             widget=interaction_row_2,
             hint="Maps to interaction_markers_top_targets/top_genes/min_cells/min_neighbors.",
+        )
+
+        discovery_row = self._make_sub_frame(self.advanced_content)
+        for label, variable, width in (
+            ("Gene correlations", self.gene_correlation_top_n_var, 70),
+            ("Category means", self.category_means_n_genes_var, 70),
+            ("Spatial variable", self.spatial_variable_genes_n_var, 70),
+            ("Scalebar unit", self.scalebar_unit_var, 70),
+        ):
+            self._body_label(discovery_row, label).pack(side="left", padx=(0, 4))
+            entry = ctk.CTkEntry(discovery_row, textvariable=variable, width=width, **self._theme["entry"])
+            self._register_entry_widget(entry)
+            entry.pack(side="left", padx=(0, 8))
+        self._option_row(
+            self.advanced_content,
+            15,
+            "Discovery panels",
+            widget=discovery_row,
+            hint="Set numeric values to 0 to disable optional gene discovery summaries.",
+        )
+
+        metadata_json_row = self._make_sub_frame(self.advanced_content)
+        metadata_json_row.columnconfigure(0, weight=1)
+        metadata_value_order_entry = ctk.CTkEntry(
+            metadata_json_row,
+            textvariable=self.metadata_value_order_var,
+            placeholder_text='{"condition":["control","treated"]}',
+            **self._theme["entry"],
+        )
+        self._register_entry_widget(metadata_value_order_entry)
+        metadata_value_order_entry.pack(side="left", fill="x", expand=True)
+        self._option_row(
+            self.advanced_content,
+            16,
+            "Metadata value order JSON",
+            widget=metadata_json_row,
+        )
+
+        metadata_labels_row = self._make_sub_frame(self.advanced_content)
+        metadata_labels_entry = ctk.CTkEntry(
+            metadata_labels_row,
+            textvariable=self.metadata_labels_var,
+            placeholder_text='{"sample_id":"Sample"}',
+            **self._theme["entry"],
+        )
+        self._register_entry_widget(metadata_labels_entry)
+        metadata_labels_entry.pack(side="left", fill="x", expand=True)
+        self._option_row(self.advanced_content, 17, "Metadata labels JSON", widget=metadata_labels_row)
+
+        overlay_json_row = self._make_sub_frame(self.advanced_content)
+        self._body_label(overlay_json_row, "Rotations").pack(side="left")
+        section_rotations_entry = ctk.CTkEntry(overlay_json_row, textvariable=self.section_rotations_var, width=180, **self._theme["entry"])
+        self._register_entry_widget(section_rotations_entry)
+        section_rotations_entry.pack(side="left", padx=(4, 10))
+        self._body_label(overlay_json_row, "Images JSON").pack(side="left")
+        section_images_entry = ctk.CTkEntry(overlay_json_row, textvariable=self.section_images_var, width=180, **self._theme["entry"])
+        self._register_entry_widget(section_images_entry)
+        section_images_entry.pack(side="left", padx=(4, 0))
+        self._option_row(
+            self.advanced_content,
+            18,
+            "Section overlays",
+            widget=overlay_json_row,
+            hint="Rotations accept section:angle CSV or JSON. Images expects the KaroSpace section_images JSON object.",
+        )
+
+        deconv_row = self._make_sub_frame(self.advanced_content)
+        self._body_label(deconv_row, "Deconvolutions JSON").pack(side="left")
+        deconv_entry = ctk.CTkEntry(deconv_row, textvariable=self.deconvolutions_var, width=220, **self._theme["entry"])
+        self._register_entry_widget(deconv_entry)
+        deconv_entry.pack(side="left", padx=(4, 10))
+        self._body_label(deconv_row, "Images max px").pack(side="left")
+        section_images_max_entry = ctk.CTkEntry(deconv_row, textvariable=self.section_images_max_px_var, width=80, **self._theme["entry"])
+        self._register_entry_widget(section_images_max_entry)
+        section_images_max_entry.pack(side="left", padx=(4, 0))
+        self._option_row(self.advanced_content, 19, "Overlay extras", widget=deconv_row)
+
+        loader_row = self._make_sub_frame(self.advanced_content)
+        self._body_label(loader_row, "Section order").pack(side="left")
+        section_order_entry = ctk.CTkEntry(loader_row, textvariable=self.section_order_var, width=180, **self._theme["entry"])
+        self._register_entry_widget(section_order_entry)
+        section_order_entry.pack(side="left", padx=(4, 10))
+        self._body_label(loader_row, "Metadata max cols").pack(side="left")
+        metadata_max_entry = ctk.CTkEntry(loader_row, textvariable=self.metadata_max_columns_var, width=70, **self._theme["entry"])
+        self._register_entry_widget(metadata_max_entry)
+        metadata_max_entry.pack(side="left", padx=(4, 10))
+        self.tutorial_check = ctk.CTkCheckBox(loader_row, text="Tutorial", variable=self.tutorial_var, **self._theme["checkbox"])
+        self._register_checkbox_widget(self.tutorial_check)
+        self.tutorial_check.pack(side="left", padx=(4, 0))
+        self._option_row(
+            self.advanced_content,
+            20,
+            "Loader/viewer extras",
+            widget=loader_row,
+        )
+
+        viewer_info_row = self._make_sub_frame(self.advanced_content)
+        viewer_info_entry = ctk.CTkEntry(viewer_info_row, textvariable=self.viewer_info_html_file_var, **self._theme["entry"])
+        self._register_entry_widget(viewer_info_entry)
+        viewer_info_entry.pack(side="left", fill="x", expand=True)
+        viewer_info_button = self._secondary_button(
+            viewer_info_row,
+            "Info HTML",
+            lambda: self._choose_file(self.viewer_info_html_file_var, optional=True),
+            width=96,
+        )
+        viewer_info_button.pack(side="left", padx=(8, 0))
+        self._option_row(
+            self.advanced_content,
+            21,
+            "Viewer info HTML file",
+            widget=viewer_info_row,
         )
 
         serve_row = self._make_sub_frame(self.advanced_content)
@@ -1378,108 +2703,73 @@ class ExportApp(ctk.CTk if ctk is not None else object):
         serve_port_entry.pack(side="left")
         self._option_row(
             self.advanced_content,
-            11,
+            22,
             "Preview server",
             widget=serve_row,
             hint="Optional local server to open the latest generated KaroSpace_*.html file.",
         )
-        self._set_advanced_visible(False)
+        button_row = self._make_sub_frame(controls_outer)
+        button_row.grid(row=2, column=0, sticky="ew", padx=18, pady=(16, 22))
 
-        help_tab.columnconfigure(0, weight=1)
-        help_tab.rowconfigure(2, weight=1)
-        self._section_label(help_tab, "GUIDE & WORKFLOW").grid(row=0, column=0, sticky="w", pady=(0, 6))
-        self._divider(help_tab, height=1).grid(row=1, column=0, sticky="ew", pady=(0, 10))
-        self.help_text = ctk.CTkTextbox(help_tab, wrap="word", **self._theme["textbox"])
-        self.help_text.grid(row=2, column=0, sticky="nsew")
-        self.help_text.insert(
-            "1.0",
-            "Basic tab\n"
-            "- Input .h5ad: absolute path to your AnnData file.\n"
-            "- Output directory: folder where KaroSpace_YYYYMMDD_HHMMSS.html is written.\n"
-            "- Coordinates: auto/obsm/obs-centroid modes are converted to KaroSpace spatial input.\n"
-            "- Section groupby: section split column used by load_spatial_data.\n"
-            "- Initial color/theme/outline/title map directly to export_to_html.\n"
-            "- Runtime mode: optional numba JIT performance mode (can be less stable in frozen app).\n"
-            "- Downsample: integer cells per section (blank keeps all).\n\n"
-            "Colors & Genes tab\n"
-            "- additional_colors: obs columns offered as categorical coloring fields.\n"
-            "- groupby lists: columns used for marker/neighbor/interaction analytics.\n"
-            "- Tick selection mode: optional inspected multi-select mode. Tick obs/genes and export directly without manually adding rows.\n"
-            "- genes mode:\n"
-            "  hvgs -> use_hvgs=True with hvg_limit from count\n"
-            "  top_mean -> compute top_mean genes list from adata\n"
-            "  list_file -> choose a text file with one gene name per line\n"
-            "  manual_list -> build list from var_names picker\n"
-            "  (non-hvgs modes set use_hvgs=False)\n\n"
-            "Advanced tab\n"
-            "- Min panel size, spot size, marker top N.\n"
-            "- Neighbor stats permutations/seed and auto groupby mode.\n"
-            "- Interaction markers limits and enable/disable toggle.\n"
-            "- Serve after export starts a local preview server for the latest KaroSpace_*.html export.\n\n"
-            "Tip: click Inspect H5AD to load searchable dropdown choices from adata.obs and adata.var_names."
-        )
-        self.help_text.configure(state="disabled")
-
-        action_card = ctk.CTkFrame(controls, **self._theme["highlight_card"])
-        self._register_theme_widget("highlight_card", action_card)
-        action_card.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(16, 0))
-        button_row = self._make_sub_frame(action_card)
-        button_row.pack(fill="x", padx=14, pady=12)
-        self._section_label(button_row, "ACTIONS").pack(side="left", padx=(0, 14))
-
-        self.inspect_btn = self._secondary_button(button_row, "Inspect Dataset", self._inspect_h5ad, width=155)
+        self.inspect_btn = self._secondary_button(button_row, "Inspect Dataset", self._inspect_h5ad, width=145)
+        self._style_secondary_action_button(self.inspect_btn)
         self.inspect_btn.pack(side="left")
 
-        self.export_btn = self._primary_button(button_row, "Build Viewer", self._on_export, width=150)
-        self.export_btn.pack(side="left", padx=(12, 0))
+        self.inspect_loading_label = ctk.CTkLabel(button_row, text="⟳ Inspecting...", **self._theme["section_label"])
+        self._register_theme_widget("section_label", self.inspect_loading_label)
 
-        self.stop_server_btn = self._secondary_button(button_row, "Stop Preview", self._stop_server, width=135)
-        self.stop_server_btn.pack(side="left", padx=(12, 0))
+        self.export_btn = self._secondary_button(button_row, "Build Viewer", self._on_export_button, width=140)
+        self.export_btn.pack(side="right")
+        self._inspection_gated_widgets.append(self.export_btn)
 
         runtime_top = self._make_sub_frame(side)
         runtime_top.grid(row=0, column=0, sticky="ew")
-        self._section_label(runtime_top, "RUNTIME").pack(side="left")
+        runtime_top.columnconfigure(0, weight=1)
+        self.runtime_title_label = self._section_label(runtime_top, "RUNTIME")
+        self.runtime_title_label.grid(row=0, column=0, sticky="w")
         self.runtime_chip_label = self._pill_label(runtime_top, text="READY", muted=True)
-        self.runtime_chip_label.pack(side="right")
-        self._header_label(side, "Activity").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        self._subheader_label(side, textvariable=self.status_var).grid(row=2, column=0, sticky="w", pady=(2, 14))
+        self.runtime_chip_label.grid(row=0, column=1, sticky="e")
+        self._right_panel_widgets.append(self.runtime_chip_label)
 
         self.progress = ctk.CTkProgressBar(side, mode="determinate", **self._theme["progress"])
-        self.progress.grid(row=3, column=0, sticky="ew")
+        self._register_theme_widget("progress", self.progress)
+        self.progress.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         self.progress.set(0.0)
-        self._subheader_label(side, "Live export progress").grid(row=4, column=0, sticky="w", pady=(6, 12))
+        self._right_panel_widgets.append(self.progress)
 
-        launch_card = ctk.CTkFrame(side, **self._theme["highlight_card"])
-        self._register_theme_widget("highlight_card", launch_card)
-        launch_card.grid(row=5, column=0, sticky="ew", pady=(0, 12))
-        launch_row = self._make_sub_frame(launch_card)
-        launch_row.pack(fill="x", padx=12, pady=12)
-        self._secondary_button(launch_row, "Open Output Folder", self._open_output_folder, width=165).pack(side="left")
-        self._secondary_button(launch_row, "Open Viewer", self._open_viewer, width=125).pack(side="left", padx=(10, 0))
+        launch_row = self._make_sub_frame(side)
+        launch_row.grid(row=2, column=0, sticky="ew", pady=(14, 12))
+        self.open_output_btn = self._secondary_button(launch_row, "Open Output Folder", self._open_output_folder, width=165)
+        self.open_output_btn.pack(side="left")
+        self.open_viewer_btn = self._secondary_button(launch_row, "Open Viewer", self._open_viewer, width=125)
+        self.open_viewer_btn.pack(side="left", padx=(10, 0))
+        self._right_panel_widgets.extend([self.open_output_btn, self.open_viewer_btn])
 
-        log_card = ctk.CTkFrame(side, **self._theme["highlight_card"])
-        self._register_theme_widget("highlight_card", log_card)
-        log_card.grid(row=6, column=0, sticky="nsew")
-        log_wrap = self._make_sub_frame(log_card)
-        log_wrap.pack(fill="both", expand=True, padx=12, pady=12)
+        log_wrap = self._make_sub_frame(side)
+        log_wrap.grid(row=3, column=0, sticky="nsew")
         log_wrap.columnconfigure(0, weight=1)
         log_wrap.rowconfigure(1, weight=1)
 
-        self._section_label(log_wrap, "EVENT LOG").grid(row=0, column=0, sticky="w", pady=(0, 6))
+        self.event_log_label = self._section_label(log_wrap, "EVENT LOG")
+        self.event_log_label.grid(row=0, column=0, sticky="w", pady=(0, 6))
         self.log_text = ctk.CTkTextbox(log_wrap, wrap="word", **self._theme["textbox"])
         self.log_text.grid(row=1, column=0, sticky="nsew")
         self.log_text.configure(state="disabled")
 
-        self.genes_mode_var.trace_add("write", lambda *_: self._update_genes_mode_visibility())
+        self.downsample_var.trace_add("write", lambda *_: self._update_export_estimate())
+        self.section_groupby_var.trace_add("write", lambda *_: self._update_export_estimate())
         self.neighbor_auto_var.trace_add("write", lambda *_: self._update_neighbor_groupby_state())
         self.selection_mode_var.trace_add("write", lambda *_: self._update_selection_mode_visibility())
         self.status_var.trace_add("write", lambda *_: self._sync_runtime_chip())
+        self.h5ad_var.trace_add("write", lambda *_: self._refresh_input_gate())
+        self.theme_var.trace_add("write", lambda *_: self._sync_theme_toggle())
         self._apply_preset("default", log=False)
         self._sync_app_theme_to_viewer_setting()
         self._sync_runtime_chip()
-        self._update_genes_mode_visibility()
         self._update_neighbor_groupby_state()
         self._set_selection_mode_visible(False)
+        self._refresh_input_gate()
+        self._update_export_estimate()
 
     def _path_field(
         self,
@@ -1489,16 +2779,29 @@ class ExportApp(ctk.CTk if ctk is not None else object):
         variable: tk.StringVar,
         choose_file: bool,
         optional: bool = False,
+        gated: bool = False,
     ) -> int:
-        self._field_label(parent, label).grid(row=row, column=0, sticky="nw", pady=(0, 8), padx=(0, 14))
-        entry = self._entry(parent, variable)
+        row_widgets: list[tk.Widget] = []
+        label_widget = self._field_label(parent, label)
+        label_widget.grid(row=row, column=0, sticky="nw", pady=(0, 8), padx=(0, 14))
+        row_widgets.append(label_widget)
+        placeholder = "/absolute/path/to/input.h5ad" if variable is self.h5ad_var else None
+        entry = self._entry(parent, variable, placeholder=placeholder)
         entry.grid(row=row, column=1, sticky="ew", pady=(0, 8))
+        row_widgets.append(entry)
 
         if choose_file:
             button = self._secondary_button(parent, "Browse", lambda: self._choose_file(variable, optional=optional), width=96)
+            self._secondary_action_buttons.append(button)
+            self._style_secondary_action_button(button)
         else:
             button = self._secondary_button(parent, "Browse", lambda: self._choose_dir(variable), width=96)
+            self._secondary_action_buttons.append(button)
+            self._style_secondary_action_button(button)
         button.grid(row=row, column=2, sticky="e", pady=(0, 8), padx=(10, 0))
+        row_widgets.append(button)
+        if gated:
+            self._inspection_gated_widgets.extend(row_widgets)
         return row + 1
 
     def _option_row(
@@ -1508,29 +2811,101 @@ class ExportApp(ctk.CTk if ctk is not None else object):
         label: str,
         widget: tk.Widget,
         hint: str | None = None,
+        gated: bool = False,
     ) -> int:
-        self._field_label(parent, label).grid(row=row, column=0, sticky="nw", pady=(0, 4), padx=(0, 14))
+        row_widgets: list[tk.Widget] = []
+        label_widget = self._field_label(parent, label)
+        label_widget.grid(row=row, column=0, sticky="nw", pady=(0, 4), padx=(0, 14))
+        row_widgets.append(label_widget)
         widget.grid(row=row, column=1, columnspan=2, sticky="ew", pady=(0, 4))
+        row_widgets.append(widget)
         row += 1
         if hint:
-            self._subheader_label(parent, hint).grid(row=row, column=1, columnspan=2, sticky="w", pady=(0, 10))
+            hint_widget = self._subheader_label(parent, hint)
+            hint_widget.grid(row=row, column=1, columnspan=2, sticky="w", pady=(0, 10))
+            row_widgets.append(hint_widget)
             row += 1
+        if gated:
+            self._inspection_gated_widgets.extend(row_widgets)
         return row
 
-    def _entry(self, parent: tk.Widget, variable: tk.StringVar) -> ctk.CTkEntry:
-        entry = ctk.CTkEntry(parent, textvariable=variable, **self._theme["entry"])
+    def _entry(self, parent: tk.Widget, variable: tk.StringVar, *, placeholder: str | None = None) -> ctk.CTkEntry:
+        kwargs = dict(self._theme["entry"])
+        if not placeholder:
+            entry = ctk.CTkEntry(parent, textvariable=variable, **kwargs)
+            self._register_entry_widget(entry)
+            return entry
+
+        entry = ctk.CTkEntry(parent, **kwargs)
         self._register_entry_widget(entry)
+        placeholder_state = {"active": False, "syncing": False}
+
+        def show_placeholder() -> None:
+            if variable.get().strip():
+                return
+            placeholder_state["syncing"] = True
+            placeholder_state["active"] = True
+            entry.configure(text_color=self._app_palette["muted"])
+            entry.delete(0, "end")
+            entry.insert(0, placeholder)
+            placeholder_state["syncing"] = False
+
+        def show_value(value: str) -> None:
+            placeholder_state["syncing"] = True
+            placeholder_state["active"] = False
+            entry.configure(text_color=self._app_palette["text"])
+            entry.delete(0, "end")
+            entry.insert(0, value)
+            placeholder_state["syncing"] = False
+
+        def sync_from_variable(*_args: object) -> None:
+            if placeholder_state["syncing"]:
+                return
+            value = variable.get()
+            if value.strip():
+                show_value(value)
+            elif entry.focus_get() is entry:
+                placeholder_state["active"] = False
+                entry.configure(text_color=self._app_palette["text"])
+                entry.delete(0, "end")
+            else:
+                show_placeholder()
+
+        def on_focus_in(_event: object) -> None:
+            if placeholder_state["active"]:
+                placeholder_state["active"] = False
+                entry.configure(text_color=self._app_palette["text"])
+                entry.delete(0, "end")
+
+        def on_focus_out(_event: object) -> None:
+            if not entry.get().strip():
+                variable.set("")
+                show_placeholder()
+
+        def on_key_release(_event: object) -> None:
+            if placeholder_state["active"] or placeholder_state["syncing"]:
+                return
+            placeholder_state["syncing"] = True
+            variable.set(entry.get())
+            placeholder_state["syncing"] = False
+
+        variable.trace_add("write", sync_from_variable)
+        entry.bind("<FocusIn>", on_focus_in)
+        entry.bind("<FocusOut>", on_focus_out)
+        entry.bind("<KeyRelease>", on_key_release)
+        self._placeholder_refreshers.append(sync_from_variable)
+        show_placeholder()
         return entry
 
     def _coords_dropdown(self, parent: tk.Widget) -> ctk.CTkOptionMenu:
-        combo = ctk.CTkOptionMenu(
+        self.coords_menu = ctk.CTkOptionMenu(
             parent,
             variable=self.coords_var,
             values=["auto", "obsm:spatial", "obs:centroid_x_y"],
             **self._theme["combo"],
         )
-        self._register_combo_widget(combo)
-        return combo
+        self._register_combo_widget(self.coords_menu)
+        return self.coords_menu
 
     def _groupby_dropdown(self, parent: tk.Widget) -> ctk.CTkComboBox:
         self.groupby_combo = ctk.CTkComboBox(
@@ -1564,76 +2939,6 @@ class ExportApp(ctk.CTk if ctk is not None else object):
         )
         self._register_combo_widget(self.outline_combo)
         return self.outline_combo
-
-    def _theme_dropdown(self, parent: tk.Widget) -> ctk.CTkOptionMenu:
-        combo = ctk.CTkOptionMenu(
-            parent,
-            variable=self.theme_var,
-            values=["light", "dark"],
-            command=self._on_theme_selected,
-            **self._theme["combo"],
-        )
-        self._register_combo_widget(combo)
-        return combo
-
-    def _genes_mode_row(self, parent: tk.Widget) -> ctk.CTkFrame:
-        wrap = self._make_sub_frame(parent)
-
-        self.genes_mode_combo = ctk.CTkOptionMenu(
-            wrap,
-            variable=self.genes_mode_var,
-            values=["hvgs", "top_mean", "list_file", "manual_list"],
-            width=130,
-            **self._theme["combo"],
-        )
-        self._register_combo_widget(self.genes_mode_combo)
-        self.genes_mode_combo.pack(side="left")
-
-        self.genes_count_entry = ctk.CTkEntry(wrap, textvariable=self.genes_count_var, width=92, **self._theme["entry"])
-        self._register_entry_widget(self.genes_count_entry)
-        self.genes_count_entry.pack(side="left", padx=(10, 0))
-
-        self.genes_count_label = self._body_label(wrap, "N genes")
-        self.genes_count_label.pack(side="left", padx=(8, 0))
-
-        self.gene_list_entry = ctk.CTkEntry(wrap, textvariable=self.gene_list_path_var, width=260, **self._theme["entry"])
-        self._register_entry_widget(self.gene_list_entry)
-        self.gene_list_button = self._secondary_button(
-            wrap,
-            "Gene List",
-            lambda: self._choose_file(self.gene_list_path_var, optional=False),
-            width=96,
-        )
-
-        return wrap
-
-    def _update_genes_mode_visibility(self) -> None:
-        mode = self.genes_mode_var.get().strip().lower()
-        if mode == "manual_list":
-            self.genes_count_entry.pack_forget()
-            self.genes_count_label.pack_forget()
-            self.gene_list_entry.pack_forget()
-            self.gene_list_button.pack_forget()
-            if hasattr(self, "manual_genes_editor"):
-                self.manual_genes_editor.grid()
-            return
-
-        if hasattr(self, "manual_genes_editor"):
-            self.manual_genes_editor.grid_remove()
-
-        if mode == "list_file":
-            self.genes_count_entry.pack_forget()
-            self.genes_count_label.pack_forget()
-            if not self.gene_list_entry.winfo_manager():
-                self.gene_list_entry.pack(side="left", padx=(10, 0))
-                self.gene_list_button.pack(side="left", padx=(10, 0))
-            return
-
-        self.gene_list_entry.pack_forget()
-        self.gene_list_button.pack_forget()
-        if not self.genes_count_entry.winfo_manager():
-            self.genes_count_entry.pack(side="left", padx=(10, 0))
-            self.genes_count_label.pack(side="left", padx=(8, 0))
 
     def _update_neighbor_groupby_state(self) -> None:
         # Groupby list is shared by marker/neighbor/interaction settings.
@@ -1670,18 +2975,7 @@ class ExportApp(ctk.CTk if ctk is not None else object):
         self._log(
             f"Applied selection mode picks: additional_colors={len(additional)}, groupby={len(groupby)}, genes={len(genes)}"
         )
-
-    def _toggle_advanced(self) -> None:
-        self._set_advanced_visible(not bool(self.advanced_open_var.get()))
-
-    def _set_advanced_visible(self, visible: bool) -> None:
-        self.advanced_open_var.set(bool(visible))
-        if visible:
-            self.advanced_content.grid()
-            self.advanced_toggle_btn.configure(text="Hide Advanced Options")
-        else:
-            self.advanced_content.grid_remove()
-            self.advanced_toggle_btn.configure(text="Show Advanced Options")
+        self._update_export_estimate()
 
     @staticmethod
     def _merge_unique(*groups: list[str]) -> list[str]:
@@ -1704,65 +2998,105 @@ class ExportApp(ctk.CTk if ctk is not None else object):
 
     def _apply_preset(self, name: str, *, log: bool = True) -> None:
         # Shared baseline.
-        if not self.h5ad_var.get().strip():
-            self.h5ad_var.set("/absolute/path/to/input.h5ad")
         if not self.outdir_var.get().strip():
             self.outdir_var.set(str((Path.cwd() / "karospace_export").resolve()))
         self.coords_var.set("auto")
+        self.spatialdata_table_var.set("")
+        self.section_order_var.set("")
+        self.metadata_value_order_var.set("")
+        self.metadata_max_columns_var.set("")
         self.serve_var.set(False)
         self.port_var.set("8000")
         self.downsample_var.set("")
-        self.genes_count_var.set("100")
-        self.gene_list_path_var.set("")
         self.section_groupby_var.set("sample_id")
         self.initial_color_var.set("leiden")
         self.title_var.set("KaroSpace")
         if not self.theme_var.get().strip():
             self.theme_var.set("dark")
         self.outline_by_var.set("condition")
+        self.metadata_labels_var.set("")
+        self.viewer_info_html_file_var.set("")
+        self.tutorial_var.set(False)
         self.min_panel_size_var.set("120")
         self.spot_size_var.set("auto")
         self.numba_jit_var.set(False)
-        self.marker_genes_top_n_var.set("50")
+        self.feature_encoding_var.set("auto")
+        self.feature_value_encoding_var.set("uint16")
+        self.feature_storage_var.set("embedded")
+        self.feature_manifest_path_var.set("")
+        self.feature_sidecar_shard_size_var.set("256")
+        self.feature_sparse_zero_threshold_var.set("0.8")
+        self.modalities_var.set("")
+        self.pseudobulk_embed_top_n_per_comparison_var.set("20")
         self.neighbor_auto_var.set(True)
         self.neighbor_permutations_var.set("auto")
         self.neighbor_stats_seed_var.set("0")
+        self.pseudobulk_enabled_var.set(True)
+        self.pseudobulk_replicate_annotation_var.set("")
+        self.pseudobulk_simple_constrast_categories_var.set("")
+        self.pseudobulk_counts_layer_var.set("counts")
+        self.pseudobulk_min_cell_counts_var.set("0")
+        self.pseudobulk_min_gene_counts_var.set("0")
+        self.pseudobulk_min_cells_per_pseudobulk_var.set("20")
+        self.pseudobulk_min_replicates_var.set("2")
+        self.pseudobulk_min_pct_expressed_var.set("0")
+        self.pseudobulk_p_adjust_method_var.set("fdr_bh")
+        self.pseudobulk_padj_cutoff_var.set("0.05")
+        self.pseudobulk_log2fc_cutoff_var.set("0.5")
+        self.pseudobulk_deseq2_fit_type_var.set("parametric")
+        self.pseudobulk_n_cpus_var.set("1")
+        self.pathway_gmt_var.set("")
+        self.pathway_organism_var.set("Human")
+        self.pathway_top_n_var.set("20")
+        self.pathway_min_overlap_var.set("3")
+        self.pathway_gsea_permutations_var.set("100")
         self.interaction_markers_enabled_var.set(False)
         self.interaction_markers_top_targets_var.set("8")
         self.interaction_markers_top_genes_var.set("20")
         self.interaction_markers_min_cells_var.set("30")
         self.interaction_markers_min_neighbors_var.set("1")
+        self.section_rotations_var.set("")
+        self.deconvolutions_var.set("")
+        self.gene_correlation_top_n_var.set("10")
+        self.category_means_n_genes_var.set("500")
+        self.spatial_variable_genes_n_var.set("200")
+        self.scalebar_unit_var.set("um")
+        self.section_images_var.set("")
+        self.section_images_max_px_var.set("4096")
         self.section_groupby_var.set("sample_id")
         self.initial_color_var.set("leiden")
         self.outline_by_var.set("condition")
         self.min_panel_size_var.set("150")
         self.additional_colors_editor.set_items(["leiden_1", "leiden_2", "gmm_mana_10"])
         self.groupby_editor.set_items([])
-        self.genes_mode_var.set("hvgs")
-        self.genes_count_var.set("20")
+        self.section_metadata_editor.set_items(["course", "region", "condition"])
+        self.section_metadata_extra_editor.set_items([])
         self.manual_genes_editor.set_items(["Cd4", "Cd8a", "Gfap", "Mki67"])
-        self.marker_genes_top_n_var.set("30")
+        self.pseudobulk_embed_top_n_per_comparison_var.set("20")
         self.neighbor_auto_var.set(True)
         self.neighbor_permutations_var.set("auto")
         self.interaction_markers_enabled_var.set(False)
         self.status_var.set("Ready")
 
-        self._update_genes_mode_visibility()
         self._update_neighbor_groupby_state()
         self._load_inputs_into_tick_selection(log=False)
         if log:
             self._log("Applied default input values.")
 
     def _choose_file(self, variable: tk.StringVar, optional: bool = False) -> None:
-        initial_dir = str(Path(variable.get()).expanduser().parent) if variable.get() else str(Path.cwd())
+        initial_dir = str(Path(variable.get()).expanduser().parent) if variable.get() else str(Path.home() / "Downloads")
         path = filedialog.askopenfilename(initialdir=initial_dir)
         if path:
+            if variable is self.h5ad_var:
+                self._inspect_locked_after_press = False
+                self._has_inspected_input_file = False
+                self._clear_inspection_metadata()
             variable.set(path)
         elif not optional and not variable.get():
             self._log("File selection canceled.")
 
     def _choose_dir(self, variable: tk.StringVar) -> None:
-        initial_dir = variable.get() or str(Path.cwd())
+        initial_dir = variable.get() or str(Path.home() / "Downloads")
         path = filedialog.askdirectory(initialdir=initial_dir)
         if path:
             variable.set(path)
@@ -1778,7 +3112,7 @@ class ExportApp(ctk.CTk if ctk is not None else object):
     def _inspect_h5ad(self) -> None:
         path_text = self.h5ad_var.get().strip()
         if not path_text:
-            messagebox.showerror("Missing input", "Pick an input .h5ad first.")
+            messagebox.showerror("Missing input", "Pick an input .h5ad first, or enter a SpatialData .zarr path.")
             return
 
         path = Path(path_text).expanduser().resolve()
@@ -1786,14 +3120,27 @@ class ExportApp(ctk.CTk if ctk is not None else object):
             messagebox.showerror("Missing file", f"Input file not found:\n{path}")
             return
 
+        self._inspect_locked_after_press = True
+        self._refresh_input_gate()
+        self._set_inspect_loading(True)
         self._log(f"Inspecting {path}")
         adata = None
         try:
-            ad_mod = _get_anndata()
-            try:
-                adata = ad_mod.read_h5ad(path, backed="r")
-            except Exception:
-                adata = ad_mod.read_h5ad(path)
+            if path.suffix.lower() == ".zarr":
+                import importlib
+
+                data_loader = importlib.import_module("karospace.data_loader")
+                coerce = getattr(data_loader, "_coerce_input_to_anndata")
+                adata, _source_label, _table_key = coerce(
+                    str(path),
+                    self._parse_optional_text(self.spatialdata_table_var.get()),
+                )
+            else:
+                ad_mod = _get_anndata()
+                try:
+                    adata = ad_mod.read_h5ad(path, backed="r")
+                except Exception:
+                    adata = ad_mod.read_h5ad(path)
 
             obs_cols = [str(c) for c in adata.obs.columns]
             obs_col_set = set(obs_cols)
@@ -1812,6 +3159,8 @@ class ExportApp(ctk.CTk if ctk is not None else object):
 
             self.additional_colors_editor.set_choices(obs_cols)
             self.groupby_editor.set_choices(obs_cols)
+            self.section_metadata_editor.set_choices(obs_cols)
+            self.section_metadata_extra_editor.set_choices(obs_cols)
             self.manual_genes_editor.set_choices(var_names)
             self.selection_additional_picker.set_choices(obs_cols)
             self.selection_groupby_picker.set_choices(obs_cols)
@@ -1819,7 +3168,7 @@ class ExportApp(ctk.CTk if ctk is not None else object):
             if hasattr(self, "groupby_combo"):
                 self.groupby_combo.configure(values=obs_cols)
             if hasattr(self, "color_combo"):
-                self.color_combo.configure(values=obs_cols + var_names[:200])
+                self.color_combo.configure(values=obs_cols)
             if hasattr(self, "outline_combo"):
                 self.outline_combo.configure(values=[""] + obs_cols)
 
@@ -1828,16 +3177,27 @@ class ExportApp(ctk.CTk if ctk is not None else object):
                     self.section_groupby_var.set("sample_id")
                 elif obs_cols:
                     self.section_groupby_var.set(obs_cols[0])
+            section_groupby = self.section_groupby_var.get().strip()
+            section_counts = (
+                [int(value) for value in adata.obs[section_groupby].value_counts(dropna=False).tolist()]
+                if section_groupby in obs_col_set
+                else []
+            )
             initial_color = self.initial_color_var.get().strip()
             initial_in_obs = initial_color in obs_col_set
-            initial_in_var = True if var_name_set is None else initial_color in var_name_set
-            if not initial_in_obs and not initial_in_var:
-                if "leiden" in obs_col_set:
-                    self.initial_color_var.set("leiden")
+            if not initial_in_obs:
+                clustering_color = next(
+                    (
+                        column
+                        for column in obs_cols
+                        if column.lower().startswith(("louvain", "leiden"))
+                    ),
+                    None,
+                )
+                if clustering_color:
+                    self.initial_color_var.set(clustering_color)
                 elif obs_cols:
                     self.initial_color_var.set(obs_cols[0])
-                elif var_names:
-                    self.initial_color_var.set(var_names[0])
             if self.outline_by_var.get().strip() and self.outline_by_var.get().strip() not in obs_col_set:
                 if "condition" in obs_col_set:
                     self.outline_by_var.set("condition")
@@ -1858,6 +3218,22 @@ class ExportApp(ctk.CTk if ctk is not None else object):
                     existing_groupby = [obs_cols[0]]
             self.groupby_editor.set_items(existing_groupby)
 
+            existing_section_metadata = [
+                name for name in self.section_metadata_editor.get_items() if name in obs_col_set
+            ]
+            if not existing_section_metadata:
+                existing_section_metadata = [
+                    c for c in obs_cols if c in {"course", "region", "condition", "sample_id", "sample", "batch"}
+                ]
+                if not existing_section_metadata and obs_cols:
+                    existing_section_metadata = obs_cols[: min(4, len(obs_cols))]
+            self.section_metadata_editor.set_items(existing_section_metadata)
+
+            existing_section_metadata_extra = [
+                name for name in self.section_metadata_extra_editor.get_items() if name in obs_col_set
+            ]
+            self.section_metadata_extra_editor.set_items(existing_section_metadata_extra)
+
             if var_name_set is None:
                 existing_genes = self.manual_genes_editor.get_items()
             else:
@@ -1875,7 +3251,7 @@ class ExportApp(ctk.CTk if ctk is not None else object):
             if obs_cols:
                 self._log(f"Loaded {len(obs_cols)} obs columns into additional_colors/groupby pickers.")
             if var_names:
-                self._log(f"Loaded {len(var_names)} genes into manual genes picker.")
+                self._log(f"Loaded {len(var_names)} features into feature picker.")
 
             has_spatial = "spatial" in adata.obsm
             has_centroid = {"centroid_x", "centroid_y"}.issubset(set(obs_cols))
@@ -1892,13 +3268,25 @@ class ExportApp(ctk.CTk if ctk is not None else object):
             self._inspected_h5ad_path = path
             self._inspected_var_name_set = var_name_set
             self._inspected_coords_mode = inspected_coords_mode
+            self._inspected_n_cells = int(adata.n_obs)
+            self._inspected_n_genes = int(adata.n_vars)
+            self._inspected_obs_cols = set(obs_cols)
+            self._inspected_section_counts_by_column = {}
+            if section_groupby and section_counts:
+                self._inspected_section_counts_by_column[section_groupby] = section_counts
+            self._has_inspected_input_file = True
 
             self._log(
                 f"obs columns: {len(obs_cols)} | cells: {adata.n_obs} | genes: {adata.n_vars} | "
                 f"coords: {'obsm:spatial' if has_spatial else 'obs centroids' if has_centroid else 'not detected'}"
             )
             self.status_var.set("Inspection complete")
+            self._refresh_input_gate()
+            self._update_export_estimate()
         except Exception as exc:
+            self._has_inspected_input_file = False
+            self._clear_inspection_metadata()
+            self._refresh_input_gate()
             messagebox.showerror("Inspect failed", str(exc))
             self._log(f"Inspect failed: {exc}")
         finally:
@@ -1906,6 +3294,7 @@ class ExportApp(ctk.CTk if ctk is not None else object):
                 file_obj = getattr(adata, "file", None)
                 if file_obj is not None:
                     file_obj.close()
+            self._set_inspect_loading(False)
 
     @staticmethod
     def _parse_positive_int(label: str, raw: str) -> int:
@@ -1928,6 +3317,131 @@ class ExportApp(ctk.CTk if ctk is not None else object):
         if value < 0:
             raise ValueError(f"{label} must be >= 0.")
         return value
+
+    @staticmethod
+    def _parse_non_negative_float(label: str, raw: str) -> float:
+        text = str(raw).strip()
+        try:
+            value = float(text)
+        except ValueError as exc:
+            raise ValueError(f"{label} must be a number.") from exc
+        if value < 0:
+            raise ValueError(f"{label} must be >= 0.")
+        return value
+
+    @staticmethod
+    def _parse_probability(label: str, raw: str) -> float:
+        value = ExportApp._parse_non_negative_float(label, raw)
+        if value > 1:
+            raise ValueError(f"{label} must be between 0 and 1.")
+        return value
+
+    @staticmethod
+    def _parse_csv_list(raw: str) -> list[str] | None:
+        values = [item.strip() for item in str(raw or "").split(",") if item.strip()]
+        return values or None
+
+    @staticmethod
+    def _parse_optional_text(raw: str) -> str | None:
+        text = str(raw or "").strip()
+        if not text or text.lower() in {"none", "null"}:
+            return None
+        return text
+
+    @staticmethod
+    def _parse_json_mapping(raw: str, label: str) -> dict | None:
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{label} must be valid JSON: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(f"{label} must be a JSON object.")
+        return parsed
+
+    @classmethod
+    def _parse_metadata_value_order(cls, raw: str) -> dict[str, list[str]] | None:
+        parsed = cls._parse_json_mapping(raw, "Metadata value order JSON")
+        if parsed is None:
+            return None
+        out: dict[str, list[str]] = {}
+        for key, values in parsed.items():
+            if not isinstance(values, list):
+                raise ValueError("Metadata value order JSON values must be lists.")
+            out[str(key)] = [str(value) for value in values]
+        return out or None
+
+    @classmethod
+    def _parse_metadata_labels(cls, raw: str) -> dict[str, str] | None:
+        parsed = cls._parse_json_mapping(raw, "Metadata labels JSON")
+        if parsed is None:
+            return None
+        out = {str(key): str(value) for key, value in parsed.items() if str(key).strip() and value is not None}
+        return out or None
+
+    @classmethod
+    def _parse_string_mapping(cls, raw: str, label: str) -> dict[str, str] | None:
+        parsed = cls._parse_json_mapping(raw, label)
+        if parsed is None:
+            return None
+        out = {str(key): str(value) for key, value in parsed.items() if str(key).strip() and value is not None}
+        return out or None
+
+    @classmethod
+    def _parse_section_images(cls, raw: str) -> dict[str, object] | None:
+        parsed = cls._parse_json_mapping(raw, "Section images JSON")
+        return parsed or None
+
+    @staticmethod
+    def _parse_json_object_or_list(raw: str, label: str) -> object | None:
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{label} must be valid JSON: {exc}") from exc
+        if not isinstance(parsed, (dict, list)):
+            raise ValueError(f"{label} must be a JSON object or list.")
+        return parsed
+
+    @staticmethod
+    def _parse_section_rotations(raw: str) -> dict[str, float] | None:
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        if text.startswith("{"):
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Section rotations JSON must be valid JSON: {exc}") from exc
+            if not isinstance(parsed, dict):
+                raise ValueError("Section rotations JSON must be an object.")
+            source = parsed.items()
+        else:
+            items = []
+            for token in text.split(","):
+                token = token.strip()
+                if not token:
+                    continue
+                if ":" not in token:
+                    raise ValueError("Section rotations must use section_id:angle CSV or JSON object syntax.")
+                key, value = token.split(":", 1)
+                items.append((key.strip(), value.strip()))
+            source = items
+
+        out: dict[str, float] = {}
+        for key, value in source:
+            section_id = str(key).strip()
+            if not section_id:
+                continue
+            try:
+                out[section_id] = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid rotation angle for section {section_id!r}.") from exc
+        return out or None
 
     @staticmethod
     def _parse_spot_size(raw: str) -> float | str | None:
@@ -1957,17 +3471,31 @@ class ExportApp(ctk.CTk if ctk is not None else object):
             raise ValueError("Neighbor permutations must be >= 0.")
         return value
 
+    def _read_adata_for_feature_ops(self, path: Path):
+        if path.suffix.lower() == ".zarr":
+            import importlib
+
+            data_loader = importlib.import_module("karospace.data_loader")
+            coerce = getattr(data_loader, "_coerce_input_to_anndata")
+            adata, _source_label, _table_key = coerce(
+                str(path),
+                self._parse_optional_text(self.spatialdata_table_var.get()),
+            )
+            return adata
+
+        ad_mod = _get_anndata()
+        try:
+            return ad_mod.read_h5ad(path, backed="r")
+        except Exception:
+            return ad_mod.read_h5ad(path)
+
     def _load_var_names(self, h5ad_path: Path) -> set[str]:
         if self._matches_inspected_h5ad(h5ad_path) and self._inspected_var_name_set is not None:
             return set(self._inspected_var_name_set)
 
-        ad_mod = _get_anndata()
         adata = None
         try:
-            try:
-                adata = ad_mod.read_h5ad(h5ad_path, backed="r")
-            except Exception:
-                adata = ad_mod.read_h5ad(h5ad_path)
+            adata = self._read_adata_for_feature_ops(h5ad_path)
             return {str(v) for v in adata.var_names}
         finally:
             if adata is not None and getattr(adata, "isbacked", False):
@@ -1975,80 +3503,37 @@ class ExportApp(ctk.CTk if ctk is not None else object):
                 if file_obj is not None:
                     file_obj.close()
 
-    def _compute_top_mean_genes(self, h5ad_path: Path, count: int) -> list[str]:
-        ad_mod = _get_anndata()
-        np_mod = _get_numpy()
-        adata = None
-        try:
-            try:
-                adata = ad_mod.read_h5ad(h5ad_path, backed="r")
-            except Exception:
-                adata = ad_mod.read_h5ad(h5ad_path)
-            mode = parse_genes_mode(f"top_mean:{count}")
-            obs_idx = np_mod.arange(adata.n_obs)
-            return resolve_gene_names(adata, mode, obs_indices=obs_idx)
-        finally:
-            if adata is not None and getattr(adata, "isbacked", False):
-                file_obj = getattr(adata, "file", None)
-                if file_obj is not None:
-                    file_obj.close()
-
-    def _resolve_gene_settings(
+    def _resolve_features(
         self,
         h5ad_path: Path,
-        mode: str,
         *,
         manual_genes_override: list[str] | None = None,
-    ) -> tuple[list[str] | None, bool, int]:
-        normalized = mode.strip().lower()
-        if normalized == "hvgs":
-            hvg_limit = self._parse_positive_int("HVG limit", self.genes_count_var.get())
-            return None, True, hvg_limit
-
-        use_hvgs = False
-        hvg_limit = self._parse_positive_int("HVG limit", self.genes_count_var.get() or "20")
-        if normalized == "top_mean":
-            count = self._parse_positive_int("Top-mean genes", self.genes_count_var.get())
-            genes = self._compute_top_mean_genes(h5ad_path, count)
-            return genes, use_hvgs, hvg_limit
-
-        if normalized == "list_file":
-            list_path_text = self.gene_list_path_var.get().strip()
-            if not list_path_text:
-                raise ValueError("Choose a gene list file for list_file mode.")
-            list_path = Path(list_path_text).expanduser()
-            if not list_path.exists():
-                raise ValueError(f"Gene list file not found: {list_path}")
-            genes = [line.strip() for line in list_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-        elif normalized == "manual_list":
-            genes = manual_genes_override if manual_genes_override is not None else self.manual_genes_editor.get_items()
-        else:
-            raise ValueError("Genes mode must be hvgs, top_mean, list_file, or manual_list.")
-
+    ) -> list[str] | None:
+        genes = manual_genes_override if manual_genes_override is not None else self.manual_genes_editor.get_items()
         genes = self._merge_unique(genes)
         if not genes:
-            raise ValueError("Add at least one gene for list/manual genes mode.")
+            raise ValueError("Add at least one feature.")
 
         var_names = self._load_var_names(h5ad_path)
         missing = [gene for gene in genes if gene not in var_names]
         if missing:
             preview = ", ".join(missing[:10])
-            raise ValueError(f"{len(missing)} genes are missing in var_names: {preview}")
-        return genes, use_hvgs, hvg_limit
+            raise ValueError(f"{len(missing)} features are missing in var_names: {preview}")
+        return genes
 
     def _parse_config(self) -> BuilderConfig:
         h5ad_text = self.h5ad_var.get().strip()
         outdir_text = self.outdir_var.get().strip()
 
         if not h5ad_text:
-            raise ValueError("Input .h5ad is required.")
+            raise ValueError("Input file is required.")
         if not outdir_text:
             raise ValueError("Output directory is required.")
 
         h5ad_path = Path(h5ad_text).expanduser().resolve()
         outdir = Path(outdir_text).expanduser().resolve()
         if not h5ad_path.exists():
-            raise ValueError(f"Input .h5ad not found: {h5ad_path}")
+            raise ValueError(f"Input file not found: {h5ad_path}")
 
         outdir.mkdir(parents=True, exist_ok=True)
 
@@ -2057,15 +3542,13 @@ class ExportApp(ctk.CTk if ctk is not None else object):
             raise ValueError("Coordinates must be auto, obsm:spatial, or obs:centroid_x_y.")
         coords_mode = None if coords_raw == "auto" else coords_raw
 
+        spatialdata_table = self._parse_optional_text(self.spatialdata_table_var.get())
         section_groupby = self.section_groupby_var.get().strip()
         if not section_groupby:
-            raise ValueError("Section groupby is required.")
+            raise ValueError("Section key is required.")
         initial_color = self.initial_color_var.get().strip()
         if not initial_color:
-            raise ValueError("Initial color is required.")
-        theme = self.theme_var.get().strip().lower() or "dark"
-        if theme not in {"light", "dark"}:
-            raise ValueError("Theme must be 'light' or 'dark'.")
+            raise ValueError("Main cell annotation is required.")
         title = self.title_var.get().strip() or "KaroSpace"
         outline_by = self.outline_by_var.get().strip() or None
         min_panel_size = self._parse_positive_int("Min panel size", self.min_panel_size_var.get())
@@ -2078,6 +3561,8 @@ class ExportApp(ctk.CTk if ctk is not None else object):
 
         additional_colors = self._merge_unique(self.additional_colors_editor.get_items())
         groupby_lists = self._merge_unique(self.groupby_editor.get_items())
+        section_metadata = self._merge_unique(self.section_metadata_editor.get_items())
+        section_metadata_extra = self._merge_unique(self.section_metadata_extra_editor.get_items())
         selection_mode = bool(self.selection_mode_var.get())
         manual_genes_override: list[str] | None = None
 
@@ -2088,28 +3573,86 @@ class ExportApp(ctk.CTk if ctk is not None else object):
                 additional_colors = self._merge_unique(selected_additional)
             if selected_groupby:
                 groupby_lists = self._merge_unique(selected_groupby)
-            if self.genes_mode_var.get().strip().lower() == "manual_list":
-                selected_genes = self.selection_genes_picker.get_selected()
-                if selected_genes:
-                    manual_genes_override = self._merge_unique(selected_genes)
+            selected_genes = self.selection_genes_picker.get_selected()
+            if selected_genes:
+                manual_genes_override = self._merge_unique(selected_genes)
 
-        mode = self.genes_mode_var.get().strip().lower()
-        genes, use_hvgs, hvg_limit = self._resolve_gene_settings(
+        genes = self._resolve_features(
             h5ad_path,
-            mode,
             manual_genes_override=manual_genes_override,
         )
 
-        marker_genes_top_n = self._parse_positive_int("Marker genes top N", self.marker_genes_top_n_var.get())
+        feature_encoding = self.feature_encoding_var.get().strip().lower() or "auto"
+        if feature_encoding not in {"auto", "dense", "sparse"}:
+            raise ValueError("Feature encoding must be auto, dense, or sparse.")
+        feature_value_encoding = self.feature_value_encoding_var.get().strip().lower() or "uint16"
+        if feature_value_encoding not in {"uint16", "uint8"}:
+            raise ValueError("Feature value encoding must be uint16 or uint8.")
+        feature_storage = self.feature_storage_var.get().strip().lower() or "embedded"
+        if feature_storage not in {"embedded", "sidecar"}:
+            raise ValueError("Feature storage must be embedded or sidecar.")
+        feature_manifest_path = self._parse_optional_text(self.feature_manifest_path_var.get())
+        feature_sidecar_shard_size = self._parse_positive_int(
+            "Feature sidecar shard size", self.feature_sidecar_shard_size_var.get()
+        )
+        feature_sparse_zero_threshold = self._parse_probability(
+            "Feature sparse zero threshold", self.feature_sparse_zero_threshold_var.get()
+        )
+        modalities = self._parse_csv_list(self.modalities_var.get())
+
         neighbor_permutations = self._parse_neighbor_permutations(self.neighbor_permutations_var.get())
         neighbor_seed = self._parse_non_negative_int("Neighbor stats seed", self.neighbor_stats_seed_var.get() or "0")
-        marker_genes_groupby = groupby_lists or None
         if bool(self.neighbor_auto_var.get()):
             neighbor_stats_groupby = [initial_color]
         else:
             neighbor_stats_groupby = groupby_lists or None
         interaction_enabled = bool(self.interaction_markers_enabled_var.get())
-        interaction_groupby = (groupby_lists or None) if interaction_enabled else None
+        pseudobulk_enabled = bool(self.pseudobulk_enabled_var.get())
+        pseudobulk = "auto" if pseudobulk_enabled else None
+        interaction_markers = "auto" if interaction_enabled else None
+        pseudobulk_additional_annotations = groupby_lists or None
+        pseudobulk_replicate_annotation = self._parse_optional_text(self.pseudobulk_replicate_annotation_var.get())
+        pseudobulk_simple_constrast_categories = self._parse_json_object_or_list(
+            self.pseudobulk_simple_constrast_categories_var.get(),
+            "Pseudobulk simple contrast categories JSON",
+        )
+        pseudobulk_counts_layer = self._parse_optional_text(self.pseudobulk_counts_layer_var.get())
+        pseudobulk_min_cell_counts = self._parse_non_negative_int(
+            "Pseudobulk min cell counts", self.pseudobulk_min_cell_counts_var.get()
+        )
+        pseudobulk_min_gene_counts = self._parse_non_negative_int(
+            "Pseudobulk min gene counts", self.pseudobulk_min_gene_counts_var.get()
+        )
+        pseudobulk_min_cells_per_pseudobulk = self._parse_positive_int(
+            "Pseudobulk min cells per sample", self.pseudobulk_min_cells_per_pseudobulk_var.get()
+        )
+        pseudobulk_min_replicates = self._parse_positive_int(
+            "Pseudobulk min replicates", self.pseudobulk_min_replicates_var.get()
+        )
+        pseudobulk_min_pct_expressed = self._parse_non_negative_float(
+            "Pseudobulk min pct expressed", self.pseudobulk_min_pct_expressed_var.get()
+        )
+        pseudobulk_p_adjust_method = self.pseudobulk_p_adjust_method_var.get().strip().lower() or "fdr_bh"
+        if pseudobulk_p_adjust_method not in {"fdr_bh", "bonferroni", "holm", "none"}:
+            raise ValueError("Pseudobulk p adjust method must be fdr_bh, bonferroni, holm, or none.")
+        pseudobulk_padj_cutoff = self._parse_probability("Pseudobulk padj cutoff", self.pseudobulk_padj_cutoff_var.get())
+        pseudobulk_log2fc_cutoff = self._parse_non_negative_float(
+            "Pseudobulk log2FC cutoff", self.pseudobulk_log2fc_cutoff_var.get()
+        )
+        pseudobulk_deseq2_fit_type = self.pseudobulk_deseq2_fit_type_var.get().strip().lower() or "parametric"
+        if pseudobulk_deseq2_fit_type not in {"parametric", "mean"}:
+            raise ValueError("Pseudobulk DESeq2 fit type must be parametric or mean.")
+        pseudobulk_n_cpus = self._parse_positive_int("Pseudobulk CPUs", self.pseudobulk_n_cpus_var.get())
+        pseudobulk_embed_top_n_per_comparison = self._parse_non_negative_int(
+            "Auto-embedded DE genes", self.pseudobulk_embed_top_n_per_comparison_var.get()
+        )
+        pathway_gmt = self._parse_csv_list(self.pathway_gmt_var.get())
+        pathway_organism = self.pathway_organism_var.get().strip() or "Human"
+        pathway_top_n = self._parse_positive_int("Pathway top N", self.pathway_top_n_var.get())
+        pathway_min_overlap = self._parse_positive_int("Pathway min overlap", self.pathway_min_overlap_var.get())
+        pathway_gsea_permutations = self._parse_non_negative_int(
+            "Pathway GSEA permutations", self.pathway_gsea_permutations_var.get()
+        )
         interaction_top_targets = self._parse_positive_int(
             "Interaction top targets", self.interaction_markers_top_targets_var.get()
         )
@@ -2122,36 +3665,98 @@ class ExportApp(ctk.CTk if ctk is not None else object):
         interaction_min_neighbors = self._parse_positive_int(
             "Interaction min neighbors", self.interaction_markers_min_neighbors_var.get()
         )
+        metadata_value_order = self._parse_metadata_value_order(self.metadata_value_order_var.get())
+        metadata_labels = self._parse_metadata_labels(self.metadata_labels_var.get())
+        metadata_max_columns = None
+        metadata_max_columns_text = self.metadata_max_columns_var.get().strip()
+        if metadata_max_columns_text:
+            metadata_max_columns = self._parse_positive_int("Metadata max columns", metadata_max_columns_text)
+        section_order = self._parse_csv_list(self.section_order_var.get())
+        viewer_info_html = None
+        viewer_info_path = self._parse_optional_text(self.viewer_info_html_file_var.get())
+        if viewer_info_path is not None:
+            path = Path(viewer_info_path).expanduser()
+            if not path.exists():
+                raise ValueError(f"Viewer info HTML file not found: {path}")
+            viewer_info_html = path.read_text(encoding="utf-8")
+        section_rotations = self._parse_section_rotations(self.section_rotations_var.get())
+        deconvolutions = self._parse_string_mapping(self.deconvolutions_var.get(), "Deconvolutions JSON")
+        gene_correlation_top_n = self._parse_non_negative_int("Gene correlations", self.gene_correlation_top_n_var.get())
+        category_means_n_genes = self._parse_non_negative_int("Category means", self.category_means_n_genes_var.get())
+        spatial_variable_genes_n = self._parse_non_negative_int(
+            "Spatial variable genes", self.spatial_variable_genes_n_var.get()
+        )
+        scalebar_unit = self.scalebar_unit_var.get().strip() or "um"
+        section_images = self._parse_section_images(self.section_images_var.get())
+        section_images_max_px = self._parse_positive_int("Section images max px", self.section_images_max_px_var.get())
 
         return BuilderConfig(
             h5ad_path=h5ad_path,
             outdir=outdir,
             coords_mode=coords_mode,
+            spatialdata_table=spatialdata_table,
             section_groupby=section_groupby,
+            section_order=section_order,
+            section_metadata=section_metadata or None,
+            section_metadata_extra=section_metadata_extra or None,
+            metadata_value_order=metadata_value_order,
+            metadata_max_columns=metadata_max_columns,
             initial_color=initial_color,
             title=title,
-            theme=theme,
             outline_by=outline_by,
+            metadata_labels=metadata_labels,
+            viewer_info_html=viewer_info_html,
+            tutorial=bool(self.tutorial_var.get()),
             min_panel_size=min_panel_size,
             spot_size=spot_size,
             enable_numba_jit=bool(self.numba_jit_var.get()),
             downsample=downsample,
             additional_colors=additional_colors or None,
             genes=genes,
-            use_hvgs=use_hvgs,
-            hvg_limit=hvg_limit,
-            marker_genes_groupby=marker_genes_groupby,
-            genes_mode=mode,
-            marker_genes_top_n=marker_genes_top_n,
+            feature_encoding=feature_encoding,
+            feature_value_encoding=feature_value_encoding,
+            feature_storage=feature_storage,
+            feature_manifest_path=feature_manifest_path,
+            feature_sidecar_shard_size=feature_sidecar_shard_size,
+            feature_sparse_zero_threshold=feature_sparse_zero_threshold,
+            modalities=modalities,
             neighbor_stats_groupby=neighbor_stats_groupby,
             neighbor_stats_permutations=neighbor_permutations,
             neighbor_stats_seed=neighbor_seed,
-            interaction_markers_enabled=interaction_enabled,
-            interaction_markers_groupby=interaction_groupby,
+            pseudobulk=pseudobulk,
+            pseudobulk_additional_annotations=pseudobulk_additional_annotations,
+            pseudobulk_replicate_annotation=pseudobulk_replicate_annotation,
+            pseudobulk_simple_constrast_categories=pseudobulk_simple_constrast_categories,
+            pseudobulk_counts_layer=pseudobulk_counts_layer,
+            pseudobulk_min_cell_counts=pseudobulk_min_cell_counts,
+            pseudobulk_min_gene_counts=pseudobulk_min_gene_counts,
+            pseudobulk_min_cells_per_pseudobulk=pseudobulk_min_cells_per_pseudobulk,
+            pseudobulk_min_replicates=pseudobulk_min_replicates,
+            pseudobulk_min_pct_expressed=pseudobulk_min_pct_expressed,
+            pseudobulk_p_adjust_method=pseudobulk_p_adjust_method,
+            pseudobulk_padj_cutoff=pseudobulk_padj_cutoff,
+            pseudobulk_log2fc_cutoff=pseudobulk_log2fc_cutoff,
+            pseudobulk_deseq2_fit_type=pseudobulk_deseq2_fit_type,
+            pseudobulk_n_cpus=pseudobulk_n_cpus,
+            pseudobulk_embed_top_n_per_comparison=pseudobulk_embed_top_n_per_comparison,
+            pathway_gmt=pathway_gmt,
+            pathway_organism=pathway_organism,
+            pathway_top_n=pathway_top_n,
+            pathway_min_overlap=pathway_min_overlap,
+            pathway_gsea_permutations=pathway_gsea_permutations,
+            interaction_markers=interaction_markers,
             interaction_markers_top_targets=interaction_top_targets,
             interaction_markers_top_genes=interaction_top_genes,
             interaction_markers_min_cells=interaction_min_cells,
             interaction_markers_min_neighbors=interaction_min_neighbors,
+            section_rotations=section_rotations,
+            deconvolutions=deconvolutions,
+            gene_correlation_top_n=gene_correlation_top_n,
+            category_means_n_genes=category_means_n_genes,
+            spatial_variable_genes_n=spatial_variable_genes_n,
+            scalebar_unit=scalebar_unit,
+            section_images=section_images,
+            section_images_max_px=section_images_max_px,
         )
 
     @staticmethod
@@ -2285,16 +3890,71 @@ class ExportApp(ctk.CTk if ctk is not None else object):
         _install_scanpy_inspect_fallback()
         _install_metadata_version_fallback()
 
-        try:
-            module = importlib.import_module("karospace")
-            return module.load_spatial_data, module.export_to_html
-        except Exception as exc:
-            root_exc = exc
-            candidates = [
-                (Path(__file__).resolve().parents[2] / "spatial-viewer").resolve(),
+        def _is_new_export_api(export_func) -> bool:
+            try:
+                return "main_cell_annotation" in inspect.signature(export_func).parameters
+            except Exception:
+                return False
+
+        def _snapshot_karospace_modules() -> dict[str, object]:
+            return {name: module for name, module in sys.modules.items() if name == "karospace" or name.startswith("karospace.")}
+
+        def _clear_karospace_modules() -> None:
+            for name in list(sys.modules):
+                if name == "karospace" or name.startswith("karospace."):
+                    del sys.modules[name]
+
+        def _restore_karospace_modules(snapshot: dict[str, object]) -> None:
+            _clear_karospace_modules()
+            sys.modules.update(snapshot)
+
+        def _candidate_paths() -> list[Path]:
+            root = Path(__file__).resolve().parents[2]
+            return [
+                (root / "KaroSpace").resolve(),
+                (root / "spatial-viewer").resolve(),
+                (Path.cwd().parent / "KaroSpace").resolve(),
                 (Path.cwd().parent / "spatial-viewer").resolve(),
             ]
-            for candidate in candidates:
+
+        def _try_candidate(candidate: Path, previous_modules: dict[str, object]):
+            package_dir = candidate / "karospace"
+            if not package_dir.exists():
+                return None
+            candidate_str = str(candidate)
+            if candidate_str not in sys.path:
+                sys.path.insert(0, candidate_str)
+            try:
+                _clear_karospace_modules()
+                module = importlib.import_module("karospace")
+                load_func = module.load_spatial_data
+                export_func = module.export_to_html
+                if _is_new_export_api(export_func):
+                    return load_func, export_func
+            except Exception:
+                return None
+            finally:
+                if "karospace" not in sys.modules or not _is_new_export_api(getattr(sys.modules.get("karospace"), "export_to_html", None)):
+                    _restore_karospace_modules(previous_modules)
+            return None
+
+        try:
+            module = importlib.import_module("karospace")
+            load_spatial_data = module.load_spatial_data
+            export_to_html = module.export_to_html
+            if _is_new_export_api(export_to_html):
+                return load_spatial_data, export_to_html
+            installed_modules = _snapshot_karospace_modules()
+            for candidate in _candidate_paths():
+                resolved = _try_candidate(candidate, installed_modules)
+                if resolved is not None:
+                    return resolved
+            _restore_karospace_modules(installed_modules)
+            return load_spatial_data, export_to_html
+        except Exception as exc:
+            root_exc = exc
+            empty_modules: dict[str, object] = {}
+            for candidate in _candidate_paths():
                 package_dir = candidate / "karospace"
                 if not package_dir.exists():
                     continue
@@ -2302,9 +3962,11 @@ class ExportApp(ctk.CTk if ctk is not None else object):
                 if candidate_str not in sys.path:
                     sys.path.insert(0, candidate_str)
                 try:
+                    _clear_karospace_modules()
                     module = importlib.import_module("karospace")
                     return module.load_spatial_data, module.export_to_html
                 except Exception as inner_exc:
+                    _restore_karospace_modules(empty_modules)
                     _raise_dependency_error(inner_exc)
                     continue
             _raise_dependency_error(root_exc)
@@ -2487,22 +4149,19 @@ class ExportApp(ctk.CTk if ctk is not None else object):
 
     def _set_busy(self, busy: bool) -> None:
         widgets = [
-            self.export_btn,
             self.inspect_btn,
-            self.genes_mode_combo,
-            self.genes_count_entry,
-            self.gene_list_entry,
-            self.gene_list_button,
-            self.advanced_toggle_btn,
             self.numba_jit_check,
             self.selection_mode_check,
             self.selection_apply_btn,
             self.selection_sync_btn,
+            self.theme_toggle_btn,
         ]
         for widget in widgets:
-            widget.configure(state="disabled" if busy else "normal")
+            self._configure_widget_state(widget, not busy)
         self.additional_colors_editor.set_enabled(not busy)
         self.groupby_editor.set_enabled(not busy)
+        self.section_metadata_editor.set_enabled(not busy)
+        self.section_metadata_extra_editor.set_enabled(not busy)
         self.manual_genes_editor.set_enabled(not busy)
         self.selection_additional_picker.set_enabled(not busy)
         self.selection_groupby_picker.set_enabled(not busy)
@@ -2513,6 +4172,7 @@ class ExportApp(ctk.CTk if ctk is not None else object):
         else:
             if self.status_var.get().startswith("Export running..."):
                 self.status_var.set("Ready")
+        self._refresh_input_gate()
 
     @staticmethod
     def _coerce_progress_value(value: object) -> int:
@@ -2539,29 +4199,29 @@ class ExportApp(ctk.CTk if ctk is not None else object):
             messagebox.showerror("Invalid options", str(exc))
             return
 
+        self._cancel_requested.clear()
         self._set_busy(True)
         self._log(f"Starting export: {config.h5ad_path} -> {config.outdir}")
         self._log(
             "Export options: "
             f"coords={config.coords_mode or 'auto'}, "
-            f"groupby={config.section_groupby}, "
-            f"initial_color={config.initial_color}, "
-            f"theme={config.theme}, "
+            f"section_key={config.section_groupby}, "
+            f"main_cell_annotation={config.initial_color}, "
+            f"feature_storage={config.feature_storage}, "
             f"downsample={config.downsample if config.downsample is not None else 'all'}."
         )
         self._log(
             "Gene settings: "
-            f"mode={config.genes_mode}, "
-            f"use_hvgs={config.use_hvgs}, "
-            f"hvg_limit={config.hvg_limit}, "
-            f"manual_genes={len(config.genes or [])}."
+            f"features={len(config.genes or [])}, "
+            f"feature_encoding={config.feature_encoding}."
         )
         self._log(
             "Analytics settings: "
-            f"marker_groupby={len(config.marker_genes_groupby or [])}, "
-            f"neighbor_groupby={len(config.neighbor_stats_groupby or [])}, "
+            f"pseudobulk={'on' if config.pseudobulk else 'off'}, "
+            f"pseudobulk_annotations={len(config.pseudobulk_additional_annotations or [])}, "
+            f"neighbor_annotations={len(config.neighbor_stats_groupby or [])}, "
             f"neighbor_permutations={config.neighbor_stats_permutations if config.neighbor_stats_permutations is not None else 'auto'}, "
-            f"interaction_enabled={config.interaction_markers_enabled}."
+            f"interaction_markers={'on' if config.interaction_markers else 'off'}."
         )
         self._log(
             "Runtime mode: "
@@ -2572,7 +4232,21 @@ class ExportApp(ctk.CTk if ctk is not None else object):
         self._export_thread = thread
         thread.start()
 
+    def _raise_if_cancelled(self) -> None:
+        if self._cancel_requested.is_set():
+            raise _ExportCancelled()
+
     def _run_export(self, config: BuilderConfig, serve_after_export: bool) -> None:
+        stdout_tee = _EventLogTee(sys.stdout, self._queue)
+        stderr_tee = _EventLogTee(sys.stderr, self._queue)
+        with contextlib.redirect_stdout(stdout_tee), contextlib.redirect_stderr(stderr_tee):
+            try:
+                self._run_export_body(config, serve_after_export)
+            finally:
+                stdout_tee.flush()
+                stderr_tee.flush()
+
+    def _run_export_body(self, config: BuilderConfig, serve_after_export: bool) -> None:
         temp_h5ad: Path | None = None
         total_started = time.perf_counter()
 
@@ -2580,26 +4254,52 @@ class ExportApp(ctk.CTk if ctk is not None else object):
             self._queue.put(("progress", (percent, stage, detail)))
 
         try:
+            self._raise_if_cancelled()
             emit_progress(5, "Importing API", "Resolving karospace export functions.")
             load_spatial_data, export_to_html = self._import_karospace_api(enable_numba_jit=config.enable_numba_jit)
 
+            self._raise_if_cancelled()
             emit_progress(12, "Preparing input", "Resolving coordinates mode and source data.")
             input_path, spatial_key, temp_h5ad = self._resolve_export_input(config)
             if temp_h5ad is not None:
                 self._queue.put(("log", "Converted obs centroid_x/centroid_y to temporary obsm['spatial']."))
 
+            self._raise_if_cancelled()
             emit_progress(
                 25,
                 "Loading spatial data",
                 f"Reading {input_path} with groupby='{config.section_groupby}' and spatial_key='{spatial_key}'.",
             )
             load_started = time.perf_counter()
-            dataset = load_spatial_data(
-                str(input_path),
-                groupby=config.section_groupby,
-                spatial_key=spatial_key,
-            )
+            import inspect
+
+            load_params = inspect.signature(load_spatial_data).parameters
+            if "section_key" in load_params:
+                load_kwargs: dict[str, object] = {
+                    "section_key": config.section_groupby,
+                    "spatial_key": spatial_key,
+                }
+                if config.spatialdata_table:
+                    load_kwargs["spatialdata_table"] = config.spatialdata_table
+                if config.section_order is not None:
+                    load_kwargs["section_order"] = config.section_order
+                if config.section_metadata is not None:
+                    load_kwargs["section_metadata"] = config.section_metadata
+                if config.section_metadata_extra is not None:
+                    load_kwargs["section_metadata_extra"] = config.section_metadata_extra
+                if config.metadata_value_order is not None:
+                    load_kwargs["metadata_value_order"] = config.metadata_value_order
+                if config.metadata_max_columns is not None:
+                    load_kwargs["metadata_max_columns"] = config.metadata_max_columns
+                dataset = load_spatial_data(str(input_path), **load_kwargs)
+            else:
+                dataset = load_spatial_data(
+                    str(input_path),
+                    groupby=config.section_groupby,
+                    spatial_key=spatial_key,
+                )
             load_elapsed = time.perf_counter() - load_started
+            self._raise_if_cancelled()
             emit_progress(
                 55,
                 "Validating analytics",
@@ -2608,11 +4308,9 @@ class ExportApp(ctk.CTk if ctk is not None else object):
 
             marker_groupby, neighbor_groupby, interaction_groupby, guard_warnings = self._sanitize_analytics_groupbys(
                 dataset,
-                marker_genes_groupby=config.marker_genes_groupby,
+                marker_genes_groupby=None,
                 neighbor_stats_groupby=config.neighbor_stats_groupby,
-                interaction_markers_groupby=(
-                    config.interaction_markers_groupby if config.interaction_markers_enabled else None
-                ),
+                interaction_markers_groupby=(config.pseudobulk_additional_annotations if config.interaction_markers else None),
                 neighbor_stats_permutations=config.neighbor_stats_permutations,
             )
             for warning in guard_warnings:
@@ -2623,17 +4321,80 @@ class ExportApp(ctk.CTk if ctk is not None else object):
                 68,
                 "Preparing output",
                 "Resolved analytics groupby columns: "
-                f"marker={len(marker_groupby or [])}, "
+                f"pseudobulk_additional={len(config.pseudobulk_additional_annotations or [])}, "
                 f"neighbor={len(neighbor_groupby)}, "
-                f"interaction={len(interaction_groupby or []) if config.interaction_markers_enabled else 0}, "
+                f"interaction={len(interaction_groupby or []) if config.interaction_markers else 0}, "
                 f"neighbor_permutations={neighbor_permutations if neighbor_permutations else 'off'}.",
             )
 
             output_html = self._build_output_html_path(config.outdir)
+            self._raise_if_cancelled()
             emit_progress(76, "Writing viewer", f"Exporting HTML viewer to {output_html}.")
             export_started = time.perf_counter()
-            output_html_path = Path(
-                export_to_html(
+            export_params = inspect.signature(export_to_html).parameters
+            if "main_cell_annotation" in export_params:
+                export_kwargs: dict[str, object] = {
+                    "output_path": str(output_html),
+                    "main_cell_annotation": config.initial_color,
+                    "title": config.title,
+                    "min_panel_size": config.min_panel_size,
+                    "spot_size": config.spot_size,
+                    "downsample": config.downsample,
+                    "outline_by": config.outline_by,
+                    "metadata_labels": config.metadata_labels,
+                    "viewer_info_html": config.viewer_info_html,
+                    "tutorial": config.tutorial,
+                    "cell_annotations": config.additional_colors,
+                    "features": config.genes,
+                    "feature_encoding": config.feature_encoding,
+                    "feature_value_encoding": config.feature_value_encoding,
+                    "feature_storage": config.feature_storage,
+                    "feature_manifest_path": config.feature_manifest_path,
+                    "feature_sidecar_shard_size": config.feature_sidecar_shard_size,
+                    "feature_sparse_zero_threshold": config.feature_sparse_zero_threshold,
+                    "pseudobulk": config.pseudobulk,
+                    "pseudobulk_additional_annotations": config.pseudobulk_additional_annotations,
+                    "pseudobulk_replicate_annotation": config.pseudobulk_replicate_annotation,
+                    "pseudobulk_simple_constrast_categories": config.pseudobulk_simple_constrast_categories,
+                    "pseudobulk_counts_layer": config.pseudobulk_counts_layer,
+                    "pseudobulk_min_cell_counts": config.pseudobulk_min_cell_counts,
+                    "pseudobulk_min_gene_counts": config.pseudobulk_min_gene_counts,
+                    "pseudobulk_min_cells_per_pseudobulk": config.pseudobulk_min_cells_per_pseudobulk,
+                    "pseudobulk_min_replicates": config.pseudobulk_min_replicates,
+                    "pseudobulk_min_pct_expressed": config.pseudobulk_min_pct_expressed,
+                    "pseudobulk_p_adjust_method": config.pseudobulk_p_adjust_method,
+                    "pseudobulk_padj_cutoff": config.pseudobulk_padj_cutoff,
+                    "pseudobulk_log2fc_cutoff": config.pseudobulk_log2fc_cutoff,
+                    "pseudobulk_deseq2_fit_type": config.pseudobulk_deseq2_fit_type,
+                    "pseudobulk_n_cpus": config.pseudobulk_n_cpus,
+                    "pseudobulk_embed_top_n_per_comparison": config.pseudobulk_embed_top_n_per_comparison,
+                    "pathway_gmt": config.pathway_gmt,
+                    "pathway_organism": config.pathway_organism,
+                    "pathway_top_n": config.pathway_top_n,
+                    "pathway_min_overlap": config.pathway_min_overlap,
+                    "pathway_gsea_permutations": config.pathway_gsea_permutations,
+                    "neighbor_stats_annotations": neighbor_groupby,
+                    "neighbor_stats_permutations": neighbor_permutations,
+                    "neighbor_stats_seed": config.neighbor_stats_seed,
+                    "interaction_markers": config.interaction_markers,
+                    "interaction_markers_top_targets": config.interaction_markers_top_targets,
+                    "interaction_markers_top_genes": config.interaction_markers_top_genes,
+                    "interaction_markers_min_cells": config.interaction_markers_min_cells,
+                    "interaction_markers_min_neighbors": config.interaction_markers_min_neighbors,
+                    "section_rotations": config.section_rotations,
+                    "deconvolutions": config.deconvolutions,
+                    "gene_correlation_top_n": config.gene_correlation_top_n,
+                    "category_means_n_genes": config.category_means_n_genes,
+                    "spatial_variable_genes_n": config.spatial_variable_genes_n,
+                    "scalebar_unit": config.scalebar_unit,
+                    "modalities": config.modalities,
+                    "section_images": config.section_images,
+                    "section_images_max_px": config.section_images_max_px,
+                }
+                export_kwargs = {key: value for key, value in export_kwargs.items() if key in export_params}
+                output_value = export_to_html(dataset, **export_kwargs)
+            else:
+                output_value = export_to_html(
                     dataset,
                     output_path=str(output_html),
                     color=config.initial_color,
@@ -2641,25 +4402,25 @@ class ExportApp(ctk.CTk if ctk is not None else object):
                     min_panel_size=config.min_panel_size,
                     spot_size=config.spot_size,
                     downsample=config.downsample,
-                    theme=config.theme,
                     outline_by=config.outline_by,
                     additional_colors=config.additional_colors,
                     genes=config.genes,
-                    use_hvgs=config.use_hvgs,
-                    hvg_limit=config.hvg_limit,
+                    use_hvgs=False,
+                    hvg_limit=len(config.genes or []),
                     marker_genes_groupby=marker_groupby,
-                    marker_genes_top_n=config.marker_genes_top_n,
+                    marker_genes_top_n=config.pseudobulk_embed_top_n_per_comparison,
                     neighbor_stats_groupby=neighbor_groupby,
                     neighbor_stats_permutations=neighbor_permutations,
                     neighbor_stats_seed=config.neighbor_stats_seed,
-                    interaction_markers_groupby=interaction_groupby if config.interaction_markers_enabled else None,
+                    interaction_markers_groupby=interaction_groupby if config.interaction_markers else None,
                     interaction_markers_top_targets=config.interaction_markers_top_targets,
                     interaction_markers_top_genes=config.interaction_markers_top_genes,
                     interaction_markers_min_cells=config.interaction_markers_min_cells,
                     interaction_markers_min_neighbors=config.interaction_markers_min_neighbors,
                 )
-            ).expanduser()
+            output_html_path = Path(output_value).expanduser()
             export_elapsed = time.perf_counter() - export_started
+            self._raise_if_cancelled()
             emit_progress(95, "Finalizing", f"Viewer bundle created in {export_elapsed:.1f}s: {output_html_path}")
 
             result = AppResult(
@@ -2672,8 +4433,11 @@ class ExportApp(ctk.CTk if ctk is not None else object):
             emit_progress(100, "Complete", f"Total export time: {total_elapsed:.1f}s.")
             self._queue.put(("done", result))
             if serve_after_export:
+                self._raise_if_cancelled()
                 self._queue.put(("log", "Starting preview server for the exported viewer."))
                 self._queue.put(("start_server", output_html_path))
+        except _ExportCancelled:
+            self._queue.put(("canceled", None))
         except Exception:
             self._queue.put(("error", traceback.format_exc()))
         finally:
@@ -2692,6 +4456,7 @@ class ExportApp(ctk.CTk if ctk is not None else object):
 
             if kind == "done":
                 self._set_busy(False)
+                self._cancel_requested.clear()
                 result = payload
                 assert isinstance(result, AppResult)
                 self._last_outdir = result.outdir
@@ -2700,6 +4465,11 @@ class ExportApp(ctk.CTk if ctk is not None else object):
                     f"Export complete. sections={result.n_sections}, cells={result.n_cells}, html={result.output_html}"
                 )
                 self.status_var.set("Export complete")
+            elif kind == "canceled":
+                self._set_busy(False)
+                self._cancel_requested.clear()
+                self._log("Export canceled.")
+                self.status_var.set("Canceled")
             elif kind == "start_server":
                 outdir = payload
                 assert isinstance(outdir, Path)
@@ -2716,6 +4486,7 @@ class ExportApp(ctk.CTk if ctk is not None else object):
                 self._log(str(payload))
             elif kind == "error":
                 self._set_busy(False)
+                self._cancel_requested.clear()
                 details = str(payload)
                 self._log("Export failed. See traceback in popup.")
                 self.status_var.set("Export failed")
